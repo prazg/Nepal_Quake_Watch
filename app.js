@@ -88,8 +88,8 @@ async function boot(){
 
   // Core data first so the page is usable quickly; context layers after.
   const [live, refMeta] = await Promise.all([
-    loadJSON('data/live.json').catch(()=>null),
-    loadJSON('data/reference_meta.json').catch(()=>null)
+    loadJSON('live.json').catch(()=>null),
+    loadJSON('reference_meta.json').catch(()=>null)
   ]);
   D.live = live; D.refMeta = refMeta;
 
@@ -117,17 +117,17 @@ async function boot(){
 
 async function loadContext(){
   const jobs = {
-    districts:      loadJSON('data/districts.json').catch(()=>null),
-    faults:         loadJSON('data/faults.json').catch(()=>null),
-    hospitals:      loadJSON('data/hospitals.json').catch(()=>null),
-    places:         loadJSON('data/places.json').catch(()=>null),
-    history:        loadJSON('data/history.json').catch(()=>null),
-    impacts:        loadJSON('data/impacts.json').catch(()=>null),
-    contacts:       loadJSON('data/contacts.json').catch(()=>null),
-    wards:          loadJSON('data/wards.json').catch(()=>null),
-    census:         loadJSON('data/ward_census.json').catch(()=>null),
-    nsc:            loadJSON('data/nsc.json').catch(()=>null),
-    municipalities: loadJSON('data/municipalities.json').catch(()=>null)
+    districts:      loadJSON('districts.json').catch(()=>null),
+    faults:         loadJSON('faults.json').catch(()=>null),
+    hospitals:      loadJSON('hospitals.json').catch(()=>null),
+    places:         loadJSON('places.json').catch(()=>null),
+    history:        loadJSON('history.json').catch(()=>null),
+    impacts:        loadJSON('impacts.json').catch(()=>null),
+    contacts:       loadJSON('contacts.json').catch(()=>null),
+    wards:          loadJSON('wards.json').catch(()=>null),
+    census:         loadJSON('ward_census.json').catch(()=>null),
+    nsc:            loadJSON('nsc.json').catch(()=>null),
+    municipalities: loadJSON('municipalities.json').catch(()=>null)
   };
   for (const [k,p] of Object.entries(jobs)) D[k] = await p;
 
