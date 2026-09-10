@@ -1,0 +1,127 @@
+{
+  "_README": "Every number here must be traceable to an official source. Do not add a number you cannot cite. Numbers below the national level change frequently by district and by facility, so this file links to the official directories that publish them rather than reprinting digits that may be stale. Re-verify before each release and update verified_on.",
+  "verified_on": "2026-09-08",
+  "verification_status": "UNVERIFIED BY REPOSITORY OWNER. These were compiled from public web sources and have not been confirmed against the official directories by a human. Confirm every entry before this page is published or promoted.",
+
+  "national": [
+    {
+      "number": "100",
+      "label": "Nepal Police",
+      "detail": "General emergency and rescue",
+      "source": "Widely published national short code",
+      "confidence": "high"
+    },
+    {
+      "number": "112",
+      "label": "Emergency, from any mobile",
+      "detail": "Use when you cannot recall the specific number",
+      "source": "Widely published national short code",
+      "confidence": "high"
+    },
+    {
+      "number": "102",
+      "label": "Ambulance",
+      "detail": "Medical emergency and transport",
+      "source": "Widely published national short code",
+      "confidence": "high"
+    },
+    {
+      "number": "101",
+      "label": "Fire brigade",
+      "detail": "Fire and extrication",
+      "source": "Widely published national short code",
+      "confidence": "high"
+    },
+    {
+      "number": "103",
+      "label": "Traffic Police",
+      "detail": "Road blockage and highway incidents",
+      "source": "Widely published national short code",
+      "confidence": "high"
+    },
+    {
+      "number": "1144",
+      "label": "Tourist Police",
+      "detail": "Assistance for visitors and trekkers",
+      "source": "Nepal Police published hotline",
+      "confidence": "medium"
+    },
+    {
+      "number": "1155",
+      "label": "Nepal Police helpline",
+      "detail": "Toll-free public helpline",
+      "source": "Nepal Police published hotline",
+      "confidence": "medium"
+    }
+  ],
+
+  "disaster_hotline": {
+    "status": "CONFLICTING SOURCES — VERIFY BEFORE RELYING ON THIS",
+    "explanation": "The National Emergency Operation Centre's own site lists 1149 as its toll-free disaster hotline. Separately, a July 2026 news report attributed to a Ministry of Home Affairs press release states that 1149 was replaced by 1234, which now routes Kathmandu Valley calls to NEOC and calls from the other 74 districts to the respective District Emergency Operation Centre. These two accounts cannot both be current. This has not been resolved against a primary MoHA source.",
+    "candidates": [
+      {
+        "number": "1149",
+        "label": "NEOC disaster hotline (as published by NEOC)",
+        "source": "neoc.gov.np",
+        "confidence": "disputed"
+      },
+      {
+        "number": "1234",
+        "label": "Disaster hotline (reported replacement, routed to DEOC by district)",
+        "source": "News report citing an MoHA press release, July 2026",
+        "confidence": "disputed"
+      }
+    ],
+    "guidance": "Until this is resolved with MoHA or NEOC directly, the interface shows both and tells the user to try 100 or 112 if neither connects."
+  },
+
+  "institutions": [
+    {
+      "name": "National Emergency Operation Centre (NEOC)",
+      "role": "Coordinates national disaster response under the Ministry of Home Affairs",
+      "phone": ["+977-1-4200105", "+977-1-4200258"],
+      "fax": "+977-1-4200103",
+      "email": "neoc@moha.gov.np",
+      "satellite": "+8707767",
+      "website": "http://neoc.gov.np/",
+      "source": "neoc.gov.np",
+      "confidence": "medium",
+      "note": "The NEOC page carrying these numbers also contains district lists dated 2014, so the page may not be actively maintained. Confirm by phone before operational use."
+    },
+    {
+      "name": "National Earthquake Monitoring and Research Centre (NEMRC / National Seismological Centre)",
+      "role": "Nepal's official earthquake monitoring body; publishes the national catalogue",
+      "address": "Lainchaur, Kathmandu",
+      "phone": ["+977-1-4510141"],
+      "email": "info@seismonepal.gov.np",
+      "website": "https://seismonepal.gov.np/",
+      "parent": "Department of Mines and Geology, Ministry of Industry, Commerce and Supplies",
+      "source": "seismonepal.gov.np",
+      "confidence": "medium"
+    },
+    {
+      "name": "National Disaster Risk Reduction and Management Authority (NDRRMA)",
+      "role": "Publishes official casualty, rescue and relief figures during a disaster",
+      "website": "https://ndrrma.gov.np/",
+      "phone": [],
+      "source": "ndrrma.gov.np",
+      "confidence": "medium",
+      "note": "Treat NDRRMA situation reports as the authoritative source for impact figures. Always check the timestamp; early counts move."
+    }
+  ],
+
+  "district_level": {
+    "note": "District Emergency Operation Centres (DEOCs) exist in every district, but their direct numbers change and no machine-readable national directory of them was located. Rather than print digits that may be wrong when someone needs them most, this tool routes users to the national numbers and to the official directories below.",
+    "directories": [
+      { "name": "Ministry of Home Affairs", "url": "https://www.moha.gov.np/" },
+      { "name": "NDRRMA", "url": "https://ndrrma.gov.np/" },
+      { "name": "Nepal Red Cross Society", "url": "https://nrcs.org/" }
+    ]
+  },
+
+  "operational_advice": [
+    "Save 100 and 112 to your phone now. A stored contact does not need a network.",
+    "Mobile networks congest during a large event. If one line is busy, try another.",
+    "This page is a planning and situational-awareness tool. It is not an alerting system and must not be relied on for warning."
+  ]
+}

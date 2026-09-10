@@ -1,0 +1,57 @@
+name: Update earthquake data
+
+on:
+  schedule:
+    - cron: '*/20 * * * *'      # every 20 minutes
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['scripts/**', '.github/workflows/update.yml']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-data
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # These three use the standard library only, so there is no install step
+      # and nothing to go stale in a lockfile.
+      - name: Fetch USGS events and compute exposure
+        run: python scripts/update_events.py
+
+      - name: Fetch NEMRC catalogue
+        run: python scripts/fetch_nsc.py
+        continue-on-error: true      # a government page changing must not
+                                     # take down the whole feed
+        env:
+          NSC_MAX_PAGES: '40'
+
+      - name: Fetch NDRRMA recorded impacts
+        run: python scripts/fetch_bipad.py
+        continue-on-error: true
+
+      - name: Validate before publishing
+        run: python scripts/validate.py
+
+      - name: Commit if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/
+          if git diff --staged --quiet; then
+            echo "no change"
+          else
+            git commit -m "data: refresh $(date -u +%Y-%m-%dT%H:%MZ)"
+            git push
+          fi
