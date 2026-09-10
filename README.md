@@ -108,6 +108,24 @@ Our figures are Nepal-only; PAGER covers India and China too.
 
 ---
 
+## A note on basemaps
+
+CARTO's tile CDN began requiring an API key. It did not start returning
+errors — it kept answering HTTP 200 with valid PNGs of the right size and
+burned "API KEY REQUIRED" into the pixels. Status-code monitoring saw nothing
+while the live map was covered in watermarks.
+
+`scripts/check_basemaps.py` therefore inspects the tiles. It fetches five
+tiles over populated land on four continents, reduces each to a mask of its
+brightest pixels, and measures the overlap between unrelated locations. Real
+map content shares almost nothing; a watermark is identical everywhere.
+Measured: clean providers score 0.00-0.02, watermarked CARTO scores 0.96. The
+failure threshold is 0.35.
+
+It needs no OCR and no reference images, so it catches a changed watermark, a
+trial-expired stamp or an error graphic just as well. It runs weekly and on
+any change to the map code, and opens an issue on failure.
+
 ## Known limitations
 
 Read these before quoting anything from this tool.
@@ -152,6 +170,9 @@ Read these before quoting anything from this tool.
 - **The population grid inherits OSM's mapping bias**, concentrating people
   where mapping is good.
 - **No casualty estimation.** Deliberately.
+- **Basemap tiles come from third parties** offered as-is. Esri and
+  OpenTopoMap need no key today; that can change without notice, which is
+  what the weekly check is for.
 
 ---
 
@@ -173,9 +194,11 @@ scripts/
   fetch_nsc.py             NEMRC catalogue                 (CI)
   fetch_bipad.py           NDRRMA impacts                  (CI)
   validate.py              publish gate                    (CI)
+  check_basemaps.py        detects watermarked/degraded tiles (CI, weekly)
 .github/workflows/
   update.yml               live earthquake refresh, every 20 min
   quarterly.yml            reference refresh, opens a PR (Jan/Apr/Jul/Oct)
+  basemaps.yml             weekly basemap tile inspection
   pages.yml                deployment
 DATA_SOURCES.md            provenance, licences, what is wrong with each source
 ```

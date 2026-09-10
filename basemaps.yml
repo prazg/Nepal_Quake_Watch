@@ -1,0 +1,90 @@
+name: Basemap health check
+
+# CARTO's tile CDN started requiring an API key and began stamping
+# "API KEY REQUIRED" into the pixels while still answering HTTP 200. Every
+# status check passed while the live map was covered in watermarks.
+#
+# This runs weekly and inspects the tiles themselves. Weekly rather than
+# quarterly because a silently watermarked map is visible to every visitor
+# from the moment it starts, and quarterly would mean months of it.
+#
+# On failure it opens (or updates) an issue, and the failed run also emails
+# the repository owner through GitHub's default notification settings.
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'          # 06:00 UTC every Monday
+  workflow_dispatch:
+  push:
+    paths:
+      - 'assets/app.js'
+      - 'app.js'
+      - 'scripts/check_basemaps.py'
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install Pillow
+
+      - name: Inspect basemap tiles
+        id: check
+        run: |
+          set -o pipefail
+          python scripts/check_basemaps.py 2>&1 | tee /tmp/basemap.log
+
+      - name: Report to the run summary
+        if: always()
+        run: |
+          echo '### Basemap check' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat /tmp/basemap.log >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Open an issue if a provider has degraded
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let log = '';
+            try { log = fs.readFileSync('/tmp/basemap.log', 'utf8'); } catch (e) {}
+            const title = 'Basemap provider has degraded';
+            const body = [
+              'The weekly basemap check failed. A tile provider is likely',
+              'serving watermarked, placeholder, or error tiles while still',
+              'returning HTTP 200 — the same way CARTO did.',
+              '',
+              '**Open one of the tile URLs below in a browser and look at it.**',
+              '',
+              '```', log.trim(), '```',
+              '',
+              'Replacements needing no API key:',
+              '- `Canvas/World_Dark_Gray_Base` and `World_Imagery` (Esri)',
+              '- `tile.openstreetmap.org` (light, but the most durable)',
+            ].join('\n');
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', labels: 'basemap',
+            });
+            if (existing.data.length) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: existing.data[0].number, body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo,
+                title, body, labels: ['basemap'],
+              });
+            }
