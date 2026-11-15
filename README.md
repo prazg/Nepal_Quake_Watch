@@ -214,3 +214,7 @@ OpenStreetMap contributors, ODbL, via the Humanitarian OpenStreetMap Team ·
 GEM Global Active Faults Database · National Geoportal, Government of Nepal ·
 Open Knowledge Nepal LocalBoundaries (CC BY 4.0) ·
 Esri, OpenTopoMap, CARTO for basemaps.
+
+## Build
+Built by Prajwal Ghimire. CopyRight @Prajwal Ghimire.
+For relevant permissions: prajwal.1.ghimire@kcl.ac.uk
