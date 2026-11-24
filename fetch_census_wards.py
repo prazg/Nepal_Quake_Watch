@@ -62,8 +62,8 @@ except ImportError:
     sys.exit("openpyxl is required:  pip install openpyxl")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.abspath(os.path.join(HERE, ".."))
-DATA = os.path.join(ROOT, "data")
+ROOT = os.path.abspath(os.path.join(HERE, "..")) if os.path.basename(HERE) == "scripts" else HERE
+DATA = os.path.join(ROOT, "data") if os.path.isdir(os.path.join(ROOT, "data")) else ROOT
 CACHE = os.path.join(ROOT, ".cache", "census")
 os.makedirs(CACHE, exist_ok=True)
 

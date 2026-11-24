@@ -16,7 +16,7 @@ Runs entirely on GitHub Pages. No server, no build step, no API keys.
 
 | Layer | Source | Measured or estimated |
 |---|---|---|
-| Earthquake locations and magnitudes | USGS FDSN; NEMRC (Nepal) | Measured |
+| Earthquake locations and magnitudes | USGS FDSN; EMSC (SeismicPortal); NEMRC (Nepal) | Measured |
 | Shaking intensity | USGS ShakeMap | Modelled by USGS |
 | Population exposure by intensity | 2021 census ward counts × ShakeMap | Observed, grid-allocated |
 | Building vulnerability by ward | 2021 census wall material | Observed proxy |
@@ -37,39 +37,61 @@ matching NDRRMA impact records, and emergency contacts.
 ## Deploy
 
 ```bash
-git clone https://github.com/<you>/nepal-quake-watch
-cd nepal-quake-watch
+git clone https://github.com/<you>/Nepal_Quake_Watch
+cd Nepal_Quake_Watch
 
-pip install shapely            # only needed for the reference build
+pip install shapely openpyxl pyshp  # only needed for the reference build
 
-python scripts/build_reference.py   # districts, population grid, hospitals, places
-python scripts/build_local_units.py  # optional: official names from Geoportal
-python scripts/build_wards.py       # optional: ward index + grid weighting
-python scripts/fetch_census_wards.py # ward population + building vulnerability
-python scripts/build_geology.py     # faults, local levels
-python scripts/build_history.py     # historical seismicity
-python scripts/update_events.py     # live events + exposure
-python scripts/fetch_nsc.py         # NEMRC catalogue
-python scripts/fetch_bipad.py       # NDRRMA impacts
-python scripts/validate.py          # refuses to publish bad data
+python -B build_reference.py        # districts, population grid, hospitals, places
+python -B build_local_units.py      # optional: official names from Geoportal
+python -B build_wards.py            # optional: ward index + grid weighting
+python -B fetch_census_wards.py     # ward population + building vulnerability
+python -B build_geology.py          # faults, local levels
+python -B build_history.py          # historical seismicity
+python -B update_events.py          # live USGS + EMSC events + exposure
+python -B fetch_nsc.py              # NEMRC catalogue
+python -B fetch_bipad.py            # NDRRMA impacts
+python -B validate.py               # refuses to publish bad data
 
 git add . && git commit -m "initial build" && git push
 ```
 
 Then in the repository: **Settings → Pages → Source: GitHub Actions**.
 
-The three `build_*` scripts are run occasionally by hand. The three fetchers
-run every 20 minutes in `.github/workflows/update.yml`, gated on
-`validate.py` — if validation fails, nothing is committed.
+### Automated pipelines
+
+All four GitHub Actions workflows live in `.github/workflows/` and run on
+Node 24-native action majors with Python 3.12 (`python -B`):
+
+- **`.github/workflows/update.yml`** — runs every 30 minutes (and on changes to
+  the live scripts). Fetches multi-agency USGS + EMSC events
+  (`update_events.py`), the NEMRC catalogue (`fetch_nsc.py`), and NDRRMA BIPAD
+  impacts (`fetch_bipad.py`), validates everything with `validate.py`, writes a
+  run summary, and commits only `live.json`, `nsc.json`, and `impacts.json`
+  when changed. If validation fails, nothing is committed.
+- **`.github/workflows/pages.yml`** — deploys to GitHub Pages using a two-job
+  `build` → `deploy` pipeline. The `build` job runs `validate.py`, then stages
+  only the static web files (`index.html`, `style.css`, `app.js`, `*.json`,
+  `.nojekyll`) into `_site/` so Python scripts, workflows, and `.git` metadata
+  are never published.
+- **`.github/workflows/basemaps.yml`** — runs weekly every Monday at 06:00 UTC
+  (and on changes to `app.js` or `check_basemaps.py`), inspecting tile imagery
+  directly and opening or updating a `basemap` issue if a provider degrades.
+- **`.github/workflows/quarterly.yml`** — runs on 1 Jan, 1 Apr, 1 Jul and 1 Oct
+  to rebuild slow-moving reference layers (`fetch_census_wards.py`,
+  `build_reference.py`, `build_geology.py`, `build_history.py`), validate them,
+  and open a pull request for human review.
 
 `build_local_units.py` is optional and needs `pyshp` plus the National
 Geoportal shapefile placed in `sources/` (it has no API, so the download is
-manual). Its output `data/local_units.json` is committed, so a clone builds
+manual). Its output `local_units.json` is committed, so a clone builds
 correctly without it.
 
-Only the reference build needs `shapely`. The scripts that run in CI use the
-standard library alone, so the workflow has no install step and no lockfile to
-go stale.
+The live CI scripts (`update_events.py`, `fetch_nsc.py`, `fetch_bipad.py`,
+`validate.py`) use Python 3.12's standard library alone, so the 30-minute
+workflow has no dependency install step and no lockfile to go stale. Only the
+quarterly reference build (`shapely`, `openpyxl`, `pyshp`) and the weekly
+basemap check (`Pillow`) install third-party packages.
 
 ---
 
@@ -110,21 +132,26 @@ Our figures are Nepal-only; PAGER covers India and China too.
 
 ## A note on basemaps
 
-CARTO's tile CDN began requiring an API key. It did not start returning
-errors — it kept answering HTTP 200 with valid PNGs of the right size and
-burned "API KEY REQUIRED" into the pixels. Status-code monitoring saw nothing
-while the live map was covered in watermarks.
+The map offers keyless third-party basemaps — **CARTO Voyager**,
+**OpenStreetMap**, **Esri** (Dark Gray Canvas and World Imagery), and
+**OpenTopoMap**.
 
-`scripts/check_basemaps.py` therefore inspects the tiles. It fetches five
-tiles over populated land on four continents, reduces each to a mask of its
-brightest pixels, and measures the overlap between unrelated locations. Real
-map content shares almost nothing; a watermark is identical everywhere.
-Measured: clean providers score 0.00-0.02, watermarked CARTO scores 0.96. The
-failure threshold is 0.35.
+Free tile CDNs can degrade silently: when a provider begins requiring an API
+key, it often keeps answering HTTP 200 with valid PNGs of the right size while
+burning an "API KEY REQUIRED" watermark into the pixels. Status-code monitoring
+sees nothing while the live map is covered in watermarks.
+
+`check_basemaps.py` therefore inspects the tiles themselves. It reads the active
+tile templates directly from `app.js`, fetches five tiles over populated land on
+four continents, reduces each to a mask of its brightest pixels, and measures
+the overlap between unrelated locations. Real map content shares almost
+nothing; a watermark is identical everywhere. Measured: clean providers score
+0.00–0.02, watermarked tiles score ~0.96. The failure threshold is 0.35.
 
 It needs no OCR and no reference images, so it catches a changed watermark, a
-trial-expired stamp or an error graphic just as well. It runs weekly and on
-any change to the map code, and opens an issue on failure.
+trial-expired stamp or an error graphic just as well. `.github/workflows/basemaps.yml`
+runs it weekly and on any change to `app.js` or `check_basemaps.py`, and opens
+an issue on failure.
 
 ## Known limitations
 
@@ -144,8 +171,8 @@ Read these before quoting anything from this tool.
   strongly time-varying — 6 recorded events M≥4 in the 1910s against 538 in the
   2010s. That is instrumentation as much as seismicity. Nepal's authoritative
   zonation is NBC 105:2020 and is not reproduced here.
-- **USGS and NEMRC magnitudes differ** for the same event and are not
-  reconciled. Both are shown, attributed.
+- **USGS, EMSC and NEMRC magnitudes differ** for the same event and are not
+  reconciled. Values are kept attributed to their reporting agency.
 - **NDRRMA records are matched to events by date and distance only.** BIPAD
   carries no earthquake identifier. The association is a suggestion.
 - **NDRRMA reporting lags.** A low count may mean low impact or slow
@@ -170,36 +197,39 @@ Read these before quoting anything from this tool.
 - **The population grid inherits OSM's mapping bias**, concentrating people
   where mapping is good.
 - **No casualty estimation.** Deliberately.
-- **Basemap tiles come from third parties** offered as-is. Esri and
-  OpenTopoMap need no key today; that can change without notice, which is
-  what the weekly check is for.
+- **Basemap tiles come from third parties** offered as-is. CARTO Voyager,
+  OpenStreetMap, Esri and OpenTopoMap need no key today; that can change
+  without notice, which is what the weekly check is for.
 
 ---
 
 ## Repository layout
 
+Static assets, JSON datasets, and Python pipeline scripts sit in a flat root
+layout so all browser fetches (`fetch('live.json')`, etc.) resolve directly
+from the site root with zero build step:
+
 ```
 index.html                 the page
-assets/app.js              map, list, detail panel
-assets/style.css
-data/                      all generated JSON, committed
-scripts/
-  build_reference.py       districts, population grid, hospitals, places
-  build_local_units.py     official unit names/types from Geoportal (manual)
-  build_wards.py           ward centroid index + population weighting (manual)
-  fetch_census_wards.py    2021 census ward population + wall material
-  build_geology.py         active faults, local levels
-  build_history.py         historical seismicity
-  update_events.py         USGS events + exposure          (CI, every 20 min)
-  fetch_nsc.py             NEMRC catalogue                 (CI)
-  fetch_bipad.py           NDRRMA impacts                  (CI)
-  validate.py              publish gate                    (CI)
-  check_basemaps.py        detects watermarked/degraded tiles (CI, weekly)
+app.js                     map, list, detail panel
+style.css                  layout and theme
+*.json                     live feeds (live, nsc, impacts) and reference layers
+build_reference.py         districts, population grid, hospitals, places
+build_local_units.py       official unit names/types from Geoportal (manual)
+build_wards.py             ward centroid index + population weighting (manual)
+fetch_census_wards.py      2021 census ward population + wall material
+build_geology.py           active faults, local levels
+build_history.py           historical seismicity
+update_events.py           USGS + EMSC events + exposure       (CI, every 30 min)
+fetch_nsc.py               NEMRC catalogue                     (CI, every 30 min)
+fetch_bipad.py             NDRRMA impacts                      (CI, every 30 min)
+validate.py                publish gate                        (CI)
+check_basemaps.py          detects watermarked/degraded tiles  (CI, weekly)
 .github/workflows/
-  update.yml               live earthquake refresh, every 20 min
-  quarterly.yml            reference refresh, opens a PR (Jan/Apr/Jul/Oct)
+  pages.yml                validate, stage _site/, deploy GitHub Pages
+  update.yml               live earthquake refresh, every 30 min
   basemaps.yml             weekly basemap tile inspection
-  pages.yml                deployment
+  quarterly.yml            reference refresh via PR (Jan/Apr/Jul/Oct)
 DATA_SOURCES.md            provenance, licences, what is wrong with each source
 ```
 
@@ -207,13 +237,13 @@ DATA_SOURCES.md            provenance, licences, what is wrong with each source
 
 ## Attribution
 
-USGS · National Statistics Office of Nepal (2021 census) ·
-National Earthquake Monitoring and Research Centre, Department of Mines
-and Geology, Nepal · NDRRMA BIPAD Portal · OCHA Common Operational Datasets ·
-OpenStreetMap contributors, ODbL, via the Humanitarian OpenStreetMap Team ·
-GEM Global Active Faults Database · National Geoportal, Government of Nepal ·
-Open Knowledge Nepal LocalBoundaries (CC BY 4.0) ·
-Esri, OpenTopoMap, CARTO for basemaps.
+USGS · European-Mediterranean Seismological Centre (EMSC) · National Statistics
+Office of Nepal (2021 census) · National Earthquake Monitoring and Research
+Centre, Department of Mines and Geology, Nepal · NDRRMA BIPAD Portal · OCHA
+Common Operational Datasets · OpenStreetMap contributors, ODbL, via the
+Humanitarian OpenStreetMap Team · GEM Global Active Faults Database · National
+Geoportal, Government of Nepal · Open Knowledge Nepal LocalBoundaries
+(CC BY 4.0) · CARTO, OpenStreetMap, Esri, OpenTopoMap for basemaps.
 
 ## Build
 Built by Prajwal Ghimire. CopyRight @Prajwal Ghimire.

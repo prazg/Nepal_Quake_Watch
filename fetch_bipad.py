@@ -29,20 +29,24 @@ Important limits, stated because they change how the numbers should be read:
 
 import json
 import os
+import ssl
 import sys
+import tempfile
 import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DATA = os.path.abspath(os.path.join(HERE, "..", "data"))
+ROOT = os.path.abspath(os.path.join(HERE, "..")) if os.path.basename(HERE) == "scripts" else HERE
+DATA = os.path.join(ROOT, "data") if os.path.isdir(os.path.join(ROOT, "data")) else ROOT
 
 BASE = "https://bipadportal.gov.np/api/v1/incident/"
 HAZARD_EARTHQUAKE = 8          # confirmed against /api/v1/hazard/
 PAGE = 200
 MAX_PAGES = 40
 
-UA = {"User-Agent": "nepal-quake-watch/0.1 (research; contact via repository)"}
+UA = {"User-Agent": "nepal-quake-watch/0.2 (research; contact via repository)"}
 
 LOSS_FIELDS = {
     "peopleDeathCount": "deaths",
@@ -65,6 +69,25 @@ LOSS_FIELDS = {
 }
 
 
+def atomic_write_json(path, obj):
+    """Write JSON via a same-directory temp file and os.replace."""
+    parent = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(prefix=".impacts_", suffix=".tmp", dir=parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(obj, f, separators=(",", ":"), ensure_ascii=False)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def get(url, retries=3, timeout=120):
     last = None
     for a in range(retries):
@@ -81,22 +104,33 @@ def get(url, retries=3, timeout=120):
 def main():
     print("fetching BIPAD earthquake incidents ...", flush=True)
     records, offset = [], 0
-    for page in range(MAX_PAGES):
-        url = (f"{BASE}?hazard={HAZARD_EARTHQUAKE}&limit={PAGE}"
-               f"&offset={offset}&expand=loss&ordering=-incident_on")
-        d = get(url)
-        results = d.get("results", [])
-        if not results:
-            break
-        records.extend(results)
-        offset += PAGE
-        time.sleep(0.5)
-        if len(results) < PAGE:
-            break
-        if page and page % 5 == 0:
-            print(f"  ... {len(records)} incidents", flush=True)
+    try:
+        for page in range(MAX_PAGES):
+            url = (f"{BASE}?hazard={HAZARD_EARTHQUAKE}&limit={PAGE}"
+                   f"&offset={offset}&expand=loss&ordering=-incident_on")
+            d = get(url)
+            results = d.get("results", [])
+            if not results:
+                break
+            records.extend(results)
+            offset += PAGE
+            time.sleep(0.5)
+            if len(results) < PAGE:
+                break
+            if page and page % 5 == 0:
+                print(f"  ... {len(records)} incidents", flush=True)
+    except (ssl.SSLCertVerificationError, ssl.SSLError,
+            urllib.error.URLError, OSError, json.JSONDecodeError) as e:
+        print(f"bipadportal.gov.np TLS/connection error — keeping previous "
+              f"impacts.json intact ({e})", file=sys.stderr)
+        return 1
 
     print(f"  {len(records)} incidents retrieved")
+    path = os.path.join(DATA, "impacts.json")
+    if not records and os.path.exists(path):
+        print("BIPAD returned zero incidents — keeping previous impacts.json "
+              "intact", file=sys.stderr)
+        return 1
 
     incidents, totals = [], {v: 0 for v in LOSS_FIELDS.values()}
     n_verified = 0
@@ -156,14 +190,12 @@ def main():
         "verified_totals": totals,
         "incidents": incidents,
     }
-    path = os.path.join(DATA, "impacts.json")
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(out, f, separators=(",", ":"), ensure_ascii=False)
-        f.write("\n")
+    atomic_write_json(path, out)
     print(f"wrote impacts.json ({len(incidents)} incidents, "
           f"{n_verified} verified, {os.path.getsize(path)/1024:.0f} KB)")
     if totals:
         print("  verified totals:", {k: totals[k] for k in list(totals)[:6]})
+    return 0
 
 
 if __name__ == "__main__":

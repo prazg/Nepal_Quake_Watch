@@ -1,0 +1,105 @@
+name: Basemap health check
+
+# Tile providers can degrade silently — answering HTTP 200 with valid PNGs
+# while stamping "API KEY REQUIRED" or placeholder graphics into the pixels.
+# This workflow runs weekly (and on map code changes) to inspect tile imagery
+# directly and opens or updates a GitHub issue on failure.
+
+on:
+  schedule:
+    - cron: '0 6 * * 1' # 06:00 UTC every Monday
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'app.js'
+      - 'check_basemaps.py'
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: basemap-health-check
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install Pillow
+        run: python -B -m pip install --no-cache-dir Pillow
+
+      - name: Inspect basemap tiles
+        id: check
+        run: |
+          set -o pipefail
+          python -B check_basemaps.py 2>&1 | tee /tmp/basemap.log
+
+      - name: Report to the run summary
+        if: always()
+        run: |
+          echo '### Basemap check' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          if [ -f /tmp/basemap.log ]; then
+            cat /tmp/basemap.log >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "(no basemap log captured)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open an issue if a provider has degraded
+        if: failure()
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require('fs');
+            let log = '';
+            try { log = fs.readFileSync('/tmp/basemap.log', 'utf8'); } catch (e) {}
+            const title = 'Basemap provider has degraded';
+            const body = [
+              'The weekly basemap check failed. A tile provider is likely',
+              'serving watermarked, placeholder, or error tiles while still',
+              'returning HTTP 200.',
+              '',
+              '**Open one of the tile URLs below in a browser and look at it.**',
+              '',
+              '```', log.trim() || '(no output captured)', '```',
+              '',
+              'Configured keyless tile providers:',
+              '- `basemaps.cartocdn.com` (CARTO Voyager)',
+              '- `tile.openstreetmap.org` (OpenStreetMap)',
+              '- `Canvas/World_Dark_Gray_Base` and `World_Imagery` (Esri)',
+              '- `tile.opentopomap.org` (OpenTopoMap)',
+            ].join('\n');
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'basemap',
+            });
+            if (existing.data.length) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.data[0].number,
+                body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels: ['basemap'],
+              });
+            }

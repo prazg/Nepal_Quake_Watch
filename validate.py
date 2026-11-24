@@ -10,14 +10,39 @@ earthquake.
 Exit code 1 fails the workflow.
 """
 
+import glob
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 
-DATA = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data"))
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.abspath(os.path.join(HERE, "..")) if os.path.basename(HERE) == "scripts" else HERE
+DATA = os.path.join(ROOT, "data") if os.path.isdir(os.path.join(ROOT, "data")) else ROOT
 
 BBOX = dict(minlon=79.5, maxlon=88.8, minlat=25.8, maxlat=31.0)
+
+ORPHANED_ROOT_WORKFLOWS = (
+    "update.yml",
+    "basemaps.yml",
+    "quarterly.yml",
+    "pages.yml",
+)
+
+DEPRECATED_NODE20_ACTIONS = (
+    "checkout@v4",
+    "checkout@v5",
+    "setup-python@v5",
+    "configure-pages@v5",
+    "upload-pages-artifact@v3",
+    "upload-pages-artifact@v4",
+    "deploy-pages@v4",
+    "github-script@v7",
+    "create-pull-request@v6",
+    "create-pull-request@v7",
+)
 
 failures, warnings = [], []
 
@@ -62,6 +87,9 @@ def check_live():
             break
         if e.get("depth") is not None and not (-5 <= e["depth"] <= 800):
             fail(f"event {e['id']} has an implausible depth {e['depth']}")
+            break
+        if e.get("source") == "EMSC" and e.get("depth") is not None and e["depth"] < 0:
+            fail(f"EMSC event {e['id']} has negative depth {e['depth']}")
             break
 
     ts = [e["t"] for e in evs]
@@ -245,8 +273,92 @@ def check_contacts():
             fail(f"contact {n.get('number')} has no source recorded")
 
 
+class _MetaCollector(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.metas = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() == "meta":
+            self.metas.append({k.lower(): (v or "") for k, v in attrs})
+
+
+def check_site_and_workflows():
+    """Verify web assets, strict security headers, repo cleanliness, and CI actions."""
+    for asset in ("index.html", "style.css", "app.js"):
+        if not os.path.isfile(os.path.join(ROOT, asset)):
+            fail(f"required web asset is missing: {asset}")
+
+    index_path = os.path.join(ROOT, "index.html")
+    if os.path.isfile(index_path):
+        with open(index_path, encoding="utf-8") as f:
+            html = f.read()
+        parser = _MetaCollector()
+        parser.feed(html)
+
+        ref_vals = [
+            m.get("content", "").strip().lower()
+            for m in parser.metas
+            if m.get("name", "").strip().lower() == "referrer"
+        ]
+        if "no-referrer" in ref_vals:
+            fail("index.html uses forbidden referrer policy 'no-referrer'")
+        if "strict-origin-when-cross-origin" not in ref_vals:
+            fail('index.html is missing <meta name="referrer" '
+                 'content="strict-origin-when-cross-origin">')
+
+        csp_vals = [
+            m.get("content", "").strip()
+            for m in parser.metas
+            if m.get("http-equiv", "").strip().lower() == "content-security-policy"
+        ]
+        if not csp_vals:
+            fail('index.html is missing <meta http-equiv="Content-Security-Policy">')
+        else:
+            csp = csp_vals[0]
+            directives = {}
+            for part in csp.split(";"):
+                tokens = part.strip().split()
+                if tokens:
+                    directives[tokens[0].lower()] = [t.lower() for t in tokens[1:]]
+            if "default-src" not in directives:
+                fail("index.html Content-Security-Policy is missing default-src")
+            elif "*" in directives["default-src"]:
+                fail("index.html Content-Security-Policy default-src must not be '*'")
+            if "'unsafe-eval'" in csp.lower():
+                fail("index.html Content-Security-Policy must not allow 'unsafe-eval'")
+            if "'unsafe-inline'" in directives.get("script-src", []):
+                fail("index.html Content-Security-Policy script-src must not allow 'unsafe-inline'")
+
+    if os.path.exists(os.path.join(ROOT, "mnt")):
+        fail("stray mnt/ directory exists in repository root")
+
+    for wf in ORPHANED_ROOT_WORKFLOWS:
+        if os.path.exists(os.path.join(ROOT, wf)):
+            fail(f"orphaned workflow file exists in repository root: {wf}")
+
+    wf_dir = os.path.join(ROOT, ".github", "workflows")
+    wf_files = sorted(
+        glob.glob(os.path.join(wf_dir, "*.yml"))
+        + glob.glob(os.path.join(wf_dir, "*.yaml"))
+    )
+    if not wf_files:
+        fail(".github/workflows/ has no workflow YAML files")
+    for wf_path in wf_files:
+        rel = os.path.relpath(wf_path, ROOT).replace("\\", "/")
+        with open(wf_path, encoding="utf-8") as f:
+            for lineno, raw_line in enumerate(f, 1):
+                active = raw_line.split("#", 1)[0]
+                for act in DEPRECATED_NODE20_ACTIONS:
+                    if re.search(rf"(?:^|[/\s'\"]){re.escape(act)}(?:[.\s'\"]|$)", active):
+                        fail(f"{rel}:{lineno} uses deprecated Node 20 action {act}")
+
+    print(f"  site & workflows: {len(wf_files)} workflow file(s) checked")
+
+
 def main():
-    print("validating data/ ...")
+    rel_data = os.path.relpath(DATA, ROOT)
+    print(f"validating {rel_data}/ ..." if rel_data != "." else "validating repository data ...")
     check_reference()
     check_live()
     check_nsc()
@@ -255,6 +367,7 @@ def main():
     check_wards()
     check_ward_census()
     check_contacts()
+    check_site_and_workflows()
 
     for w in warnings:
         print(f"  WARN  {w}")

@@ -29,8 +29,8 @@ catch a "TRIAL EXPIRED" or "UPGRADE YOUR PLAN" stamp just as well.
 It also flags the cruder failure modes: non-image responses, tiles that are a
 single flat colour, and tiles far outside a plausible byte range.
 
-Basemap URLs are read out of assets/app.js rather than duplicated here, so
-this cannot drift from what the site actually loads.
+Basemap URLs are read out of app.js (or assets/app.js) rather than duplicated
+here, so this cannot drift from what the site actually loads.
 
 Exit code 1 fails the workflow.
 """
@@ -44,16 +44,20 @@ import urllib.request
 try:
     from PIL import Image
 except ImportError:
-    sys.exit("Pillow is required for this check:  pip install Pillow")
+    Image = None
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.abspath(os.path.join(HERE, ".."))
+ROOT = os.path.abspath(os.path.join(HERE, "..")) if os.path.basename(HERE) == "scripts" else HERE
+DATA = os.path.join(ROOT, "data") if os.path.isdir(os.path.join(ROOT, "data")) else ROOT
 
-UA = {"User-Agent": "Mozilla/5.0 (compatible; nepal-quake-watch basemap check)"}
+UA = {
+    "User-Agent": "Mozilla/5.0 (compatible; nepal-quake-watch basemap check)",
+    "Referer": "https://prazg.github.io/",
+}
 
 # Widely separated tiles at zoom 7. Different continents, different terrain,
-# different label density — nothing legitimate should be common to all four.
-# Tiles over populated land on four continents. Land matters: an ocean tile
+# different label density — nothing legitimate should be common to all five.
+# Tiles over populated land on five continents. Land matters: an ocean tile
 # is a flat colour, which yields an empty mask and no signal either way.
 PROBES = [
     (7, 94, 53),      # Kathmandu
@@ -72,27 +76,91 @@ BRIGHT_PERCENTILE = 0.985      # top ~1.5% of pixels by luminance
 failures, warnings, notes = [], [], []
 
 
-def find_basemap_urls():
-    """Read tile template URLs out of the app, so this tracks the real site."""
-    for candidate in ("assets/app.js", "app.js"):
-        path = os.path.join(ROOT, candidate)
-        if os.path.exists(path):
-            src = open(path, encoding="utf-8").read()
-            break
-    else:
-        sys.exit("could not find app.js")
+def redact_url(u):
+    """Mask query-string API keys (e.g. ?key=...) so secrets never leak to logs."""
+    return re.sub(
+        r"([?&](?:api_?key|key|access_token|token)=)[^&\s'\"]+",
+        r"\1***",
+        str(u),
+        flags=re.IGNORECASE,
+    )
+
+
+def _strip_js_comments(src):
+    """Strip // and /* */ comments while preserving string and template literals."""
+    return re.sub(
+        r"""'(?:\\.|[^'\\\n])*'|"(?:\\.|[^"\\\n])*"|`(?:\\.|[^`\\])*`|//[^\n]*|/\*.*?\*/""",
+        lambda m: m.group(0) if m.group(0)[0] in "'\"`" else " ",
+        src,
+        flags=re.DOTALL,
+    )
+
+
+def _resolve_js_expr(expr, consts, part_re):
+    """Evaluate a simple string / template / const concatenation expression."""
+    pieces = []
+    for pm in part_re.finditer(expr):
+        tok = pm.group(0)
+        if tok[0] in ("'", '"'):
+            pieces.append(tok[1:-1])
+        elif tok[0] == "`":
+            body = tok[1:-1]
+            body = re.sub(
+                r"\$\{\s*([A-Za-z_$][\w$]*)\s*\}",
+                lambda m: consts.get(m.group(1), m.group(0)),
+                body,
+            )
+            pieces.append(body)
+        else:
+            val = consts.get(tok)
+            if val is None:
+                return None
+            pieces.append(val)
+    return "".join(pieces)
+
+
+def find_basemap_urls(src=None):
+    """Read tile template URLs out of app.js, tracking single- and multi-line calls."""
+    if src is None:
+        for candidate in ("app.js", "assets/app.js"):
+            path = os.path.join(ROOT, candidate)
+            if os.path.exists(path):
+                with open(path, encoding="utf-8") as f:
+                    src = f.read()
+                break
+        else:
+            sys.exit("could not find app.js")
+
+    clean = _strip_js_comments(src)
+
+    consts = {}
+    for cm in re.finditer(
+        r"""\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(['"])([^'"\n]+)\2""",
+        clean,
+    ):
+        consts[cm.group(1)] = cm.group(3)
+
+    token_pat = r"""(?:'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|`(?:\\.|[^`\\])*`|[A-Za-z_$][\w$]*)"""
+    expr_pat = rf"{token_pat}(?:\s*\+\s*{token_pat})*"
+    part_re = re.compile(token_pat, re.DOTALL)
+
+    patterns = (
+        re.compile(rf"L\.tileLayer\(\s*({expr_pat})", re.DOTALL),
+        re.compile(rf"\burl\s*:\s*({expr_pat})", re.DOTALL),
+    )
 
     urls = set()
-    # Literal template strings passed to L.tileLayer(...)
-    for m in re.finditer(r"L\.tileLayer\(\s*(?:ESRI\s*\+\s*)?'([^']+)'", src):
-        frag = m.group(1)
-        if "{z}" not in frag:
-            continue
-        if frag.startswith("/"):
-            base = re.search(r"const ESRI\s*=\s*'([^']+)'", src)
-            if base:
-                frag = base.group(1) + frag
-        urls.add(frag)
+    for pat in patterns:
+        for m in pat.finditer(clean):
+            frag = _resolve_js_expr(m.group(1), consts, part_re)
+            if not frag or "{z}" not in frag:
+                continue
+            if "{x}" not in frag or "{y}" not in frag:
+                continue
+            if frag.startswith("/") and "ESRI" in consts:
+                frag = consts["ESRI"] + frag
+            if frag.startswith(("http://", "https://")):
+                urls.add(frag)
     return sorted(urls)
 
 
@@ -105,7 +173,7 @@ def fetch(url, z, x, y):
 
 
 def bright_mask(img):
-    """Binary mask of the brightest pixels, as a set of (x, y)."""
+    """Binary mask of the brightest pixels, as a set of pixel indices."""
     g = img.convert("L").resize((128, 128))
     px = list(g.tobytes())
     ordered = sorted(px)
@@ -122,29 +190,34 @@ def jaccard(a, b):
 
 
 def check(url):
-    print(f"\n  {url}")
+    if Image is None:
+        sys.exit("Pillow is required for this check:  pip install Pillow")
+    safe = redact_url(url)
+    print(f"\n  {safe}")
     masks, sizes = [], []
     for z, x, y in PROBES:
         try:
-            ctype, blob, real = fetch(url, z, x, y)
+            ctype, blob, _real = fetch(url, z, x, y)
         except Exception as e:                        # noqa: BLE001
-            failures.append(f"{url} — tile {z}/{x}/{y} failed to fetch: {e}")
+            failures.append(f"{safe} — tile {z}/{x}/{y} failed to fetch: "
+                            f"{redact_url(e)}")
             return
         if "image" not in ctype:
-            failures.append(f"{url} — returned {ctype!r}, not an image. The "
+            failures.append(f"{safe} — returned {ctype!r}, not an image. The "
                             f"provider is probably serving an error page.")
             return
         try:
             img = Image.open(io.BytesIO(blob))
             img.load()
         except Exception as e:                        # noqa: BLE001
-            failures.append(f"{url} — response is not a decodable image: {e}")
+            failures.append(f"{safe} — response is not a decodable image: "
+                            f"{redact_url(e)}")
             return
 
         sizes.append(len(blob))
         ex = img.convert("L").getextrema()
         if ex[0] == ex[1]:
-            warnings.append(f"{url} — tile {z}/{x}/{y} is a single flat "
+            warnings.append(f"{safe} — tile {z}/{x}/{y} is a single flat "
                             f"colour; may be out of coverage or a placeholder")
         masks.append(bright_mask(img))
 
@@ -158,18 +231,20 @@ def check(url):
 
     if worst >= OVERLAP_FAIL:
         failures.append(
-            f"{url} — unrelated tiles share {worst:.0%} of their brightest "
+            f"{safe} — unrelated tiles share {worst:.0%} of their brightest "
             f"pixels. Something is being stamped on every tile: an API-key "
             f"or trial watermark, or an error graphic. LOOK AT A TILE.")
     elif worst >= OVERLAP_FAIL * 0.6:
         warnings.append(
-            f"{url} — bright-pixel overlap {worst:.0%} is elevated. Not "
+            f"{safe} — bright-pixel overlap {worst:.0%} is elevated. Not "
             f"conclusive, but worth opening a tile and checking.")
     else:
-        notes.append(f"{url} — clean")
+        notes.append(f"{safe} — clean")
 
 
 def main():
+    if Image is None:
+        sys.exit("Pillow is required for this check:  pip install Pillow")
     urls = find_basemap_urls()
     if not urls:
         sys.exit("no tile URLs found in app.js — has the map setup changed?")

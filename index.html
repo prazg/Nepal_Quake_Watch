@@ -3,8 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://unpkg.com; style-src 'self' https://unpkg.com; img-src 'self' data: blob: https://server.arcgisonline.com https://basemaps.cartocdn.com https://*.basemaps.cartocdn.com https://*.tile.opentopomap.org https://tile.openstreetmap.org https://unpkg.com; connect-src 'self' https://earthquake.usgs.gov https://*.usgs.gov https://www.seismicportal.eu; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'">
 <title>Nepal Quake Watch — earthquakes, shaking and exposure</title>
-<meta name="description" content="Earthquake monitoring for Nepal: USGS and NEMRC catalogues, USGS ShakeMap shaking, estimated population exposure, health facilities and official emergency contacts.">
+<meta name="description" content="Earthquake monitoring for Nepal: USGS, EMSC and NEMRC catalogues, USGS ShakeMap shaking, estimated population exposure, health facilities and official emergency contacts.">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
       integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
 <link rel="stylesheet" href="style.css">
@@ -12,6 +14,20 @@
 <body>
 
 <a class="skip" href="#events">Skip to event list</a>
+
+<nav class="prazg-suite-bar" aria-label="Nepal Open-Science Observatory Suite">
+  <span class="suite-label">Nepal Open-Science Suite</span>
+  <div class="suite-links">
+    <a href="https://prazg.github.io/" target="_blank" rel="noopener noreferrer">Observatory Hub</a>
+    <a href="https://prazg.github.io/Nepal_TRAYA/" target="_blank" rel="noopener noreferrer">Nepal TRĀYA</a>
+    <a href="https://prazg.github.io/Nepal_Quake_Watch/" aria-current="page">Nepal Quake Watch</a>
+    <a href="https://prazg.github.io/Nepal_Cryosphere_Inventory/" target="_blank" rel="noopener noreferrer">Nepal Cryosphere</a>
+    <a href="https://prazg.github.io/GLOF_dashboard/" target="_blank" rel="noopener noreferrer">HMA GLOF Dashboard</a>
+    <a href="https://prazg.github.io/Nepal_Heritage_Catalogue/" target="_blank" rel="noopener noreferrer">Nepal Heritage</a>
+    <span class="suite-sep" aria-hidden="true"></span>
+    <a class="suite-neuro" href="https://prazg.github.io/#suite" target="_blank" rel="noopener noreferrer">Open Neuro &amp; AI Suite ↗</a>
+  </div>
+</nav>
 
 <header class="bar">
   <div class="brand">
@@ -21,15 +37,20 @@
     <h1>Nepal Quake Watch</h1>
   </div>
   <div class="bar-meta">
-    <span id="freshness" class="stale">Loading…</span>
-    <button id="btn-about" class="ghost" type="button" aria-expanded="false">About the data</button>
+    <span id="freshness" class="stale" aria-live="polite">Loading…</span>
+    <button id="btn-refresh" class="ghost bar-btn" type="button" title="Check USGS and EMSC live earthquake feeds now">↻ Refresh</button>
+    <button id="btn-about" class="ghost" type="button" aria-expanded="false" aria-controls="about">About the data</button>
   </div>
 </header>
 
 <div class="warn" role="note">
   Situational awareness and planning only. This is not an alerting system and
   must not be relied on for warning. In an emergency call
-  <a href="tel:100">100</a> or <a href="tel:112">112</a>.
+  <a href="tel:100">100</a> (Police),
+  <a href="tel:102">102</a> (Ambulance),
+  <a href="tel:112">112</a>,
+  <a href="tel:1149">1149</a> (NDRRMA/NEOC), or
+  <a href="tel:1155">1155</a> (DHM).
 </div>
 
 <main class="shell">
@@ -37,8 +58,8 @@
   <section class="rail" aria-label="Earthquake list">
     <div class="rail-controls">
       <div class="seg" role="group" aria-label="Catalogue">
-        <button type="button" data-cat="usgs" class="on">USGS</button>
-        <button type="button" data-cat="nemrc">NEMRC</button>
+        <button type="button" data-cat="usgs" class="on" aria-pressed="true">USGS + EMSC</button>
+        <button type="button" data-cat="nemrc" aria-pressed="false">NEMRC</button>
       </div>
       <label class="magf">
         Minimum magnitude
@@ -56,10 +77,10 @@
 
 </main>
 
-<div id="about" class="sheet" hidden>
+<div id="about" class="sheet" role="dialog" aria-modal="true" aria-labelledby="about-title" hidden>
   <div class="sheet-inner">
     <button class="close" id="about-close" type="button" aria-label="Close">Close</button>
-    <h2>What this shows, and what it does not</h2>
+    <h2 id="about-title">What this shows, and what it does not</h2>
     <div id="about-body"></div>
   </div>
 </div>

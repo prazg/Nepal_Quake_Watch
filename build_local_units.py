@@ -60,8 +60,8 @@ from shapely.geometry import shape
 from shapely.strtree import STRtree
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.abspath(os.path.join(HERE, ".."))
-DATA = os.path.join(ROOT, "data")
+ROOT = os.path.abspath(os.path.join(HERE, "..")) if os.path.basename(HERE) == "scripts" else HERE
+DATA = os.path.join(ROOT, "data") if os.path.isdir(os.path.join(ROOT, "data")) else ROOT
 CACHE = os.path.join(ROOT, ".cache")
 SOURCES = os.path.join(ROOT, "sources")
 

@@ -1,0 +1,127 @@
+name: Quarterly reference refresh
+
+# Nepal's National Statistics Office republishes census tables, and OSM,
+# NDRRMA and the boundary CODs all move. The 30-minute workflow only touches
+# live earthquake data; this one refreshes the slow-moving reference layers.
+#
+# It opens a pull request rather than committing to main. These layers change
+# rarely, and when they do change the diff deserves a human look — a silently
+# rebuilt population grid is exactly the kind of thing that should not land
+# unreviewed on a page people consult after an earthquake.
+
+on:
+  schedule:
+    - cron: '0 3 1 1,4,7,10 *' # 03:00 UTC on 1 Jan, 1 Apr, 1 Jul, 1 Oct
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: quarterly-reference-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install build dependencies
+        run: python -B -m pip install --no-cache-dir shapely openpyxl pyshp
+
+      - name: Record current state for comparison
+        run: |
+          mkdir -p /tmp/before
+          cp reference_meta.json popgrid.json /tmp/before/ || true
+
+      - name: Refresh census ward data (NSO)
+        run: python -B fetch_census_wards.py
+        continue-on-error: true
+
+      - name: Rebuild reference layers
+        run: python -B build_reference.py
+
+      - name: Rebuild geology and local levels
+        run: python -B build_geology.py
+        continue-on-error: true
+
+      - name: Rebuild historical seismicity
+        run: python -B build_history.py
+        continue-on-error: true
+
+      # build_local_units.py and build_wards.py are NOT run here. They need
+      # National Geoportal shapefiles that have no API and must be downloaded
+      # by hand; their committed outputs are reused instead.
+
+      - name: Remove build cache
+        run: rm -rf .cache
+
+      - name: Validate datasets
+        run: python -B validate.py
+
+      - name: Summarise what changed
+        run: |
+          echo "### Reference refresh" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          python -B - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import json
+
+
+          def load(path):
+              try:
+                  with open(path, encoding="utf-8") as f:
+                      return json.load(f)
+              except Exception:
+                  return {}
+
+
+          before_meta = load("/tmp/before/reference_meta.json")
+          after_meta = load("reference_meta.json")
+          changes = []
+          for key in sorted(set(before_meta) | set(after_meta)):
+              if isinstance(after_meta.get(key), (int, float)) and before_meta.get(key) != after_meta.get(key):
+                  changes.append(f"{key}: {before_meta.get(key)} -> {after_meta.get(key)}")
+
+          before_grid = load("/tmp/before/popgrid.json")
+          after_grid = load("popgrid.json")
+          before_total = sum(c[2] for c in before_grid.get("cells", []))
+          after_total = sum(c[2] for c in after_grid.get("cells", []))
+          if before_total != after_total:
+              changes.append(f"population grid total: {before_total:,} -> {after_total:,}")
+
+          if changes:
+              for line in changes:
+                  print(line)
+          else:
+              print("No numeric reference changes detected.")
+          EOF
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open a pull request
+        uses: peter-evans/create-pull-request@v8
+        with:
+          commit-message: "data: quarterly reference refresh"
+          branch: auto/quarterly-refresh
+          delete-branch: true
+          add-paths: |
+            *.json
+          title: "Quarterly reference data refresh"
+          body: |
+            Automated refresh of the slow-moving reference layers.
+
+            **Review before merging.** Check the workflow summary for changes
+            to population totals and counts. A large unexplained shift in the
+            population grid means an upstream source changed shape, not that
+            Nepal's population changed.
+
+            Not refreshed here (manual, no API): National Geoportal local-unit
+            and ward boundaries. Re-run `build_local_units.py` and
+            `build_wards.py` locally if the Geoportal republishes.

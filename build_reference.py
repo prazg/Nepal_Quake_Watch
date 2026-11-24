@@ -33,8 +33,9 @@ from shapely.prepared import prep
 from shapely.strtree import STRtree
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DATA = os.path.abspath(os.path.join(HERE, "..", "data"))
-CACHE = os.path.abspath(os.path.join(HERE, "..", ".cache"))
+ROOT = os.path.abspath(os.path.join(HERE, "..")) if os.path.basename(HERE) == "scripts" else HERE
+DATA = os.path.join(ROOT, "data") if os.path.isdir(os.path.join(ROOT, "data")) else ROOT
+CACHE = os.path.join(ROOT, ".cache")
 os.makedirs(DATA, exist_ok=True)
 os.makedirs(CACHE, exist_ok=True)
 

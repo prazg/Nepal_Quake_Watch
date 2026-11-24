@@ -54,8 +54,8 @@ except ImportError:
 from shapely.geometry import shape
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.abspath(os.path.join(HERE, ".."))
-DATA = os.path.join(ROOT, "data")
+ROOT = os.path.abspath(os.path.join(HERE, "..")) if os.path.basename(HERE) == "scripts" else HERE
+DATA = os.path.join(ROOT, "data") if os.path.isdir(os.path.join(ROOT, "data")) else ROOT
 SOURCES = os.path.join(ROOT, "sources")
 
 SHP = os.path.join(SOURCES, "ward_nameupdated_wgs.shp")

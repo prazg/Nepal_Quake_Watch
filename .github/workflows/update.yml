@@ -1,0 +1,151 @@
+name: Update earthquake data
+
+on:
+  schedule:
+    - cron: '*/30 * * * *' # every 30 minutes
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'update_events.py'
+      - 'fetch_nsc.py'
+      - 'fetch_bipad.py'
+      - 'validate.py'
+      - '.github/workflows/update.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-data
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 10
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # These scripts use Python 3.12's standard library only, so there is no
+      # install step and nothing to go stale in a lockfile.
+      - name: Fetch live earthquake events and compute exposure
+        run: python -B update_events.py
+
+      - name: Fetch NEMRC catalogue
+        run: python -B fetch_nsc.py
+        continue-on-error: true
+        env:
+          NSC_MAX_PAGES: '40'
+
+      - name: Fetch NDRRMA recorded impacts
+        run: python -B fetch_bipad.py
+        continue-on-error: true
+
+      - name: Validate before publishing
+        run: python -B validate.py
+
+      - name: Write run summary
+        if: always()
+        run: |
+          python -B - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          from datetime import datetime, timezone
+
+
+          def load(path):
+              try:
+                  with open(path, encoding="utf-8") as f:
+                      return json.load(f)
+              except Exception:
+                  return {}
+
+
+          def esc(text):
+              return str(text or "").replace("|", "\\|").replace("\n", " ").strip()
+
+
+          def fmt_ts(ms):
+              if ms is None:
+                  return "unknown time"
+              return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+          live = load("live.json")
+          live_evs = live.get("events") or []
+          exp_count = sum(1 for e in live_evs if e.get("exposure"))
+          agencies = {}
+          for e in live_evs:
+              agency = e.get("agency") or e.get("source")
+              if agency:
+                  agencies[str(agency)] = agencies.get(str(agency), 0) + 1
+          if agencies:
+              breakdown = ", ".join(f"{k}: {v}" for k, v in sorted(agencies.items()))
+              live_count_str = f"{len(live_evs)} events ({breakdown}; {exp_count} with exposure)"
+          else:
+              live_count_str = f"{len(live_evs)} events ({exp_count} with exposure)"
+
+          if live_evs:
+              e0 = live_evs[0]
+              mtype = f" {e0.get('magType')}" if e0.get("magType") else ""
+              mag = f"M{e0.get('mag')}{mtype}" if e0.get("mag") is not None else "M?"
+              src = e0.get("agency") or e0.get("source")
+              src_tag = f" [{esc(src)}]" if src else ""
+              latest_live = f"{mag}{src_tag} — {esc(e0.get('place') or 'Unknown')} ({fmt_ts(e0.get('t'))})"
+          else:
+              latest_live = "none"
+
+          nsc = load("nsc.json")
+          nsc_evs = nsc.get("events") or []
+          if nsc_evs:
+              n0 = nsc_evs[0]
+              latest_nsc = (
+                  f"M{n0.get('mag')} {n0.get('magType') or 'ML'} — "
+                  f"{esc(n0.get('epicentre') or 'Unknown')} ({esc(n0.get('utc'))})"
+              )
+          else:
+              latest_nsc = "none"
+
+          bipad = load("impacts.json")
+          bipad_inc = bipad.get("incidents") or []
+          bipad_counts = bipad.get("counts") or {}
+          bipad_total = bipad_counts.get("incidents", len(bipad_inc))
+          bipad_verified = bipad_counts.get("verified")
+          if bipad_verified is not None:
+              bipad_count_str = f"{bipad_total} incidents ({bipad_verified} verified)"
+          else:
+              bipad_count_str = f"{bipad_total} incidents"
+          latest_bipad = esc(bipad_inc[0].get("on", "")[:10]) if bipad_inc else "none"
+
+          print("### Earthquake data refresh\n")
+          print("| Feed | Count | Latest |")
+          print("|---|---|---|")
+          print(f"| Live (`live.json`) | {live_count_str} | {latest_live} |")
+          print(f"| NEMRC (`nsc.json`) | {len(nsc_evs)} events | {latest_nsc} |")
+          print(f"| NDRRMA BIPAD (`impacts.json`) | {bipad_count_str} | {latest_bipad} |")
+          EOF
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for f in live.json nsc.json impacts.json; do
+            if [ -f "$f" ]; then
+              git add -- "$f"
+            fi
+          done
+          if git diff --staged --quiet; then
+            echo "No changes in live.json, nsc.json, or impacts.json"
+          else
+            git commit -m "data: refresh $(date -u +%Y-%m-%dT%H:%MZ)"
+            git pull --rebase --autostash origin main
+            git push origin main
+          fi

@@ -1,20 +1,38 @@
 /* Nepal Quake Watch
  *
- * Loading strategy: every dataset is loaded from a same-origin file in
- * data/, written by the CI pipeline. The page then tries USGS directly for
- * anything newer than the cached file. If that live call fails, the cached
- * data still renders and the header says so rather than showing an empty map.
+ * Loading strategy: every dataset is loaded from a same-origin JSON file
+ * written by the CI pipeline. The page then queries USGS (FDSN with CDN
+ * fallback) and EMSC SeismicPortal in parallel for recent events, merging
+ * cross-agency duplicates while preserving USGS ShakeMap and exposure data.
+ * If live calls fail, cached data still renders and the header says so.
  *
  * Nothing in this file estimates shaking. Intensity values come from USGS
  * ShakeMap; exposure is computed in the pipeline by sampling that ShakeMap
- * against a population grid. Events with no ShakeMap show location and
- * magnitude only, and say so.
+ * against the 2021 census ward population grid. Events with no ShakeMap show
+ * location and magnitude only, and say so.
  */
 
 const NEPAL = [28.3, 84.1];
-const D = {};                      // loaded datasets
+const DEFAULT_BBOX = { minlat: 25.8, maxlat: 31.0, minlon: 79.5, maxlon: 88.8 };
+const DEFAULT_MIN_MAG = 2.5;
+const LIVE_POLL_MS = 3 * 60 * 1000;          // 3 minutes
+const DEDUP_TIME_MS = 90 * 1000;             // <= 90 s
+const DEDUP_DIST_KM = 65;                    // <= 65 km
+const TILE_ERROR_LIMIT = 6;
+const BASEMAP_STORAGE_KEY = 'nqw.basemap';
+const EVENT_HOSTS = [
+  '*.usgs.gov',
+  'www.emsc-csem.org',
+  'www.seismicportal.eu',
+  'seismonepal.gov.np'
+];
+
+const D = {};                                // loaded datasets
 let map, layers = {}, evLayer, selected = null;
 let catalogue = 'usgs', magMin = 2.5;
+let liveRefreshInFlight = false;
+let lastLiveCheckMs = 0;
+let livePollTimer = null;
 
 /* ------------------------------------------------------------- utilities */
 
@@ -28,6 +46,7 @@ const MMI_WORD = {
 };
 
 function mmiColor(v){ return MMI_COLOR[Math.min(10, Math.max(1, Math.round(v)))]; }
+function mmiClass(v){ return 'mmi-' + Math.min(10, Math.max(3, Math.round(v))); }
 
 /** Great-circle distance in km. */
 function haversine(lat1, lon1, lat2, lon2){
@@ -42,7 +61,9 @@ const fmt = n => n == null ? '—' : n.toLocaleString('en-GB');
 const km  = d => d < 10 ? d.toFixed(1)+' km' : Math.round(d)+' km';
 
 function ago(ms){
+  if (!Number.isFinite(ms)) return '—';
   const s = (Date.now()-ms)/1000;
+  if (s < 60)     return 'just now';
   if (s < 3600)   return Math.round(s/60)+' min ago';
   if (s < 86400)  return Math.round(s/3600)+' h ago';
   if (s < 2592000)return Math.round(s/86400)+' d ago';
@@ -50,6 +71,7 @@ function ago(ms){
 }
 
 function whenText(ms){
+  if (!Number.isFinite(ms)) return '—';
   const d = new Date(ms);
   return d.toISOString().replace('T',' ').slice(0,16)+' UTC';
 }
@@ -63,79 +85,290 @@ function el(tag, cls, html){
 const esc = s => String(s ?? '').replace(/[&<>"]/g,
   c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
+function hostAllowed(hostname, allowedHosts){
+  if (!allowedHosts || !allowedHosts.length) return true;
+  const h = hostname.toLowerCase();
+  return allowedHosts.some(pattern => {
+    const p = pattern.toLowerCase();
+    if (p.startsWith('*.')){
+      const suffix = p.slice(1);
+      return h.endsWith(suffix) && h.length > suffix.length;
+    }
+    return h === p;
+  });
+}
+
+function safeUrl(u, allowedHosts){
+  if (!u || typeof u !== 'string') return null;
+  try{
+    const parsed = new URL(u.trim());
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return null;
+    if (allowedHosts && !hostAllowed(parsed.hostname, allowedHosts)) return null;
+    return parsed.href;
+  }catch(_err){
+    return null;
+  }
+}
+
+function titleCaseRegion(s){
+  const raw = String(s || '').trim();
+  if (!raw) return 'Himalayan Region';
+  if (raw !== raw.toUpperCase()) return raw;
+  const minor = new Set(['of','and','the','in','on','at','to','near','off']);
+  return raw.toLowerCase().replace(/[a-z]+/g, (word, idx) => {
+    if (idx > 0 && minor.has(word)) return word;
+    return word.charAt(0).toUpperCase() + word.slice(1);
+  });
+}
+
+function eventPageLabel(href){
+  try{
+    const h = new URL(href).hostname.toLowerCase();
+    if (h.endsWith('.usgs.gov') || h === 'usgs.gov') return 'Open USGS event page';
+    if (h === 'www.emsc-csem.org' || h === 'www.seismicportal.eu') return 'Open EMSC event page';
+    if (h === 'seismonepal.gov.np') return 'Open NEMRC catalogue';
+  }catch(_err){ /* fallback below */ }
+  return 'Open event page';
+}
+
+function sourceBadgeInfo(e){
+  if (e._nemrc){
+    return { text:'NEMRC ML', cls:'tag', catalogueText:'NEMRC (Nepal)' };
+  }
+  const srcs = Array.isArray(e.sources) && e.sources.length
+    ? e.sources
+    : [e.source || 'USGS'];
+  const hasUSGS = srcs.includes('USGS');
+  const hasEMSC = srcs.includes('EMSC');
+  const auth = e.agency && e.agency !== 'EMSC' && e.agency !== 'CSEM' ? e.agency : null;
+  if (hasUSGS && hasEMSC){
+    return {
+      text:'USGS + EMSC',
+      cls:'tag src',
+      catalogueText: auth ? `USGS + EMSC (${auth})` : 'USGS + EMSC'
+    };
+  }
+  if (hasEMSC){
+    const lbl = auth ? `EMSC · ${auth}` : 'EMSC';
+    return { text:lbl, cls:'tag src', catalogueText:lbl };
+  }
+  return { text:'USGS', cls:'tag src', catalogueText:'USGS' };
+}
+
 async function loadJSON(path){
   const r = await fetch(path, {cache:'no-cache'});
   if (!r.ok) throw new Error(path+' → '+r.status);
   return r.json();
 }
 
+async function fetchJSONWithTimeout(url, timeoutMs = 12000){
+  const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
+  try{
+    const r = await fetch(url, {
+      cache:'no-store',
+      signal: ctrl ? ctrl.signal : undefined
+    });
+    if (r.status === 204) return { features: [] };
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return await r.json();
+  }finally{
+    if (timer) clearTimeout(timer);
+  }
+}
+
 /* ------------------------------------------------------------------ boot */
 
-async function boot(){
-  map = L.map('map', {zoomControl:true, minZoom:5, maxZoom:14})
-        .setView(NEPAL, 7);
-
-  // CARTO's basemap CDN began requiring an API key and now watermarks its
-  // tiles with "API KEY REQUIRED". It still answers 200, so the failure is
-  // invisible to a status check — the text is burned into the image. Esri's
-  // Dark Gray Canvas is the replacement: free, no key, no watermark.
-  //
-  // Esri splits labels out of the base tile, so the dark basemap is a group
-  // of base plus a transparent reference layer.
+function setupBasemaps(){
   const ESRI = 'https://server.arcgisonline.com/ArcGIS/rest/services';
   const esriAttr = 'Tiles: Esri';
+  const refPol = 'strict-origin-when-cross-origin';
 
   const darkBase = L.tileLayer(
     ESRI + '/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}',
-    {maxZoom:16, attribution: esriAttr + ', HERE, Garmin, © OpenStreetMap contributors'});
+    {
+      maxZoom:19, maxNativeZoom:16, referrerPolicy:refPol,
+      attribution: esriAttr + ', HERE, Garmin, © OpenStreetMap contributors'
+    });
   const darkLabels = L.tileLayer(
     ESRI + '/Canvas/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}',
-    {maxZoom:16, attribution:''});
+    {maxZoom:19, maxNativeZoom:16, referrerPolicy:refPol, attribution:''});
   const plain = L.layerGroup([darkBase, darkLabels]);
 
-  const imagery = L.layerGroup([
-    L.tileLayer(ESRI + '/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-      {maxZoom:17, attribution: esriAttr + ', Maxar, Earthstar Geographics'}),
-    L.tileLayer(ESRI + '/Canvas/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}',
-      {maxZoom:16, attribution:''})
-  ]);
+  const voyager = L.tileLayer(
+    'https://basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png?key=cb1_5f3l_1_c31d40cdeb2723aade9ac21c',
+    {
+      maxZoom:19, maxNativeZoom:19, referrerPolicy:refPol,
+      attribution:'© OpenStreetMap contributors © CARTO'
+    });
+
+  const imageryBase = L.tileLayer(
+    ESRI + '/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+    {
+      maxZoom:19, maxNativeZoom:17, referrerPolicy:refPol,
+      attribution: esriAttr + ', Maxar, Earthstar Geographics'
+    });
+  const imageryLabels = L.tileLayer(
+    ESRI + '/Canvas/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}',
+    {maxZoom:19, maxNativeZoom:16, referrerPolicy:refPol, attribution:''});
+  const imagery = L.layerGroup([imageryBase, imageryLabels]);
 
   const terrain = L.tileLayer(
     'https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png',
-    {maxZoom:16, attribution:'© OpenTopoMap, © OpenStreetMap contributors'});
+    {
+      maxZoom:19, maxNativeZoom:16, subdomains:'abc', referrerPolicy:refPol,
+      attribution:'© OpenTopoMap (CC-BY-SA), © OpenStreetMap contributors'
+    });
 
-  plain.addTo(map);
+  const osm = L.tileLayer(
+    'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+    {
+      maxZoom:19, maxNativeZoom:19, referrerPolicy:refPol,
+      attribution:'© OpenStreetMap contributors'
+    });
+
+  const basemaps = {
+    'Plain dark': plain,
+    'CARTO Voyager': voyager,
+    'Satellite imagery': imagery,
+    'Terrain': terrain,
+    'OpenStreetMap': osm
+  };
+  const primaryTileLayers = {
+    'Plain dark': darkBase,
+    'CARTO Voyager': voyager,
+    'Satellite imagery': imageryBase,
+    'Terrain': terrain,
+    'OpenStreetMap': osm
+  };
+  const fallbackChain = ['Plain dark', 'CARTO Voyager', 'OpenStreetMap'];
+
+  let stored = 'Plain dark';
+  try{
+    const saved = localStorage.getItem(BASEMAP_STORAGE_KEY);
+    if (saved && basemaps[saved]) stored = saved;
+  }catch(_err){ /* storage unavailable */ }
+
+  let activeBasemap = stored;
+  let isAutoFallbackSwitching = false;
+  const tileErrors = {};
+  const failedProviders = new Set();
+
+  function triggerFallback(failedName){
+    failedProviders.add(failedName);
+    const nextName = fallbackChain.find(
+      name => name !== failedName && !failedProviders.has(name) && basemaps[name]
+    );
+    if (!nextName) return;
+    isAutoFallbackSwitching = true;
+    try{
+      if (map.hasLayer(basemaps[failedName])) map.removeLayer(basemaps[failedName]);
+      basemaps[nextName].addTo(map);
+      activeBasemap = nextName;
+      tileErrors[nextName] = 0;
+    }finally{
+      isAutoFallbackSwitching = false;
+    }
+  }
+
+  for (const [name, tileLayer] of Object.entries(primaryTileLayers)){
+    tileErrors[name] = 0;
+    tileLayer.on('tileload', () => {
+      tileErrors[name] = 0;
+    });
+    tileLayer.on('tileerror', () => {
+      if (isAutoFallbackSwitching || name !== activeBasemap) return;
+      tileErrors[name] = (tileErrors[name] || 0) + 1;
+      if (tileErrors[name] >= TILE_ERROR_LIMIT){
+        triggerFallback(name);
+      }
+    });
+  }
+
+  map.on('baselayerchange', ev => {
+    if (isAutoFallbackSwitching) return;
+    if (basemaps[ev.name]){
+      activeBasemap = ev.name;
+      tileErrors[ev.name] = 0;
+      failedProviders.delete(ev.name);
+      try{ localStorage.setItem(BASEMAP_STORAGE_KEY, ev.name); }catch(_err){}
+    }
+  });
+
+  basemaps[activeBasemap].addTo(map);
+  return basemaps;
+}
+
+function normalizeCachedEvents(events){
+  if (!Array.isArray(events)) return [];
+  return events.map(e => {
+    const srcs = Array.isArray(e.sources) && e.sources.length
+      ? Array.from(new Set(e.sources))
+      : [e.source || 'USGS'];
+    return { ...e, source: e.source || srcs[0] || 'USGS', sources: srcs };
+  });
+}
+
+async function boot(){
+  map = L.map('map', {zoomControl:true, minZoom:5, maxZoom:18})
+        .setView(NEPAL, 7);
+
+  const basemaps = setupBasemaps();
 
   // Core data first so the page is usable quickly; context layers after.
   const [live, refMeta] = await Promise.all([
     loadJSON('live.json').catch(()=>null),
     loadJSON('reference_meta.json').catch(()=>null)
   ]);
-  D.live = live; D.refMeta = refMeta;
+
+  if (live){
+    live.events = normalizeCachedEvents(live.events);
+    D.live = live;
+  } else {
+    D.live = {
+      generated: null,
+      query: { bbox: { ...DEFAULT_BBOX }, min_magnitude: DEFAULT_MIN_MAG },
+      events: []
+    };
+  }
+  D.refMeta = refMeta;
 
   evLayer = L.layerGroup().addTo(map);
   // One control, created up front so basemaps are switchable immediately.
   // Context overlays are added to it as they finish loading.
   layers.control = L.control.layers(
-    {'Satellite imagery':imagery, 'Terrain':terrain, 'Plain dark':plain},
+    basemaps,
     {}, {position:'topright', collapsed:true}
   ).addTo(map);
 
   if (!live){
     document.getElementById('railnote').textContent =
-      'Could not load data/live.json. The site may not have been built yet.';
+      'Could not load cached live.json — checking live USGS and EMSC feeds…';
   } else {
     render();
-    refreshFromUSGS();                       // try for something newer
   }
 
   // Context layers load in the background and are added to the control.
   loadContext();
   wireUI();
   addLegend();
+
+  // Live multi-agency seismic refresh + periodic polling.
+  refreshLiveSeismic(false);
+  scheduleLivePoll();
 }
 
 async function loadContext(){
+  const nscPromise = loadJSON('nsc.json').catch(()=>null);
+  nscPromise.then(nsc => {
+    D.nsc = nsc;
+    if (D.nsc){
+      const btn = document.querySelector('[data-cat="nemrc"]');
+      if (btn) btn.disabled = false;
+      if (catalogue === 'nemrc') render();
+    }
+  });
+
   const jobs = {
     districts:      loadJSON('districts.json').catch(()=>null),
     faults:         loadJSON('faults.json').catch(()=>null),
@@ -146,7 +379,7 @@ async function loadContext(){
     contacts:       loadJSON('contacts.json').catch(()=>null),
     wards:          loadJSON('wards.json').catch(()=>null),
     census:         loadJSON('ward_census.json').catch(()=>null),
-    nsc:            loadJSON('nsc.json').catch(()=>null),
+    nsc:            nscPromise,
     municipalities: loadJSON('municipalities.json').catch(()=>null)
   };
   for (const [k,p] of Object.entries(jobs)) D[k] = await p;
@@ -175,7 +408,7 @@ async function loadContext(){
         l.bindPopup(`<b>${esc(p.name||'Unnamed fault')}</b>`+
           `<br>Slip type: ${esc(p.slip_type||'not recorded')}`+
           `<br>Net slip rate: ${esc(p.slip_rate||'not recorded')}`+
-          `<br><span style="color:#93A4B2">Mapped active fault trace. `+
+          `<br><span class="dim-note">Mapped active fault trace. `+
           `Geological context, not a hazard rating.</span>`);
       }
     });
@@ -183,14 +416,14 @@ async function loadContext(){
   }
 
   if (D.history){
-    const cells = D.history.cells.map(([x,y,n,maxm,e]) =>
+    const cells = D.history.cells.map(([x,y,n,maxm]) =>
       L.circleMarker([y,x], {
         radius: 2 + Math.min(9, n*0.35),
         color:'#7A6FA8', weight:0, fillColor:'#7A6FA8',
         fillOpacity: Math.min(.55, .12 + n*0.02)
       }).bindPopup(`<b>Recorded seismicity</b><br>${n} events M≥4 since 1900`+
         `<br>Largest recorded: M${maxm}`+
-        `<br><span style="color:#93A4B2">Observed catalogue only. Coverage `+
+        `<br><span class="dim-note">Observed catalogue only. Coverage `+
         `improved greatly after 2015, so this maps instrumentation as well `+
         `as seismicity.</span>`));
     layers.history = L.layerGroup(cells);
@@ -204,7 +437,7 @@ async function loadContext(){
       }).bindPopup(`<b>${esc(h.n)}</b><br>Hospital`+
         (h.d?`<br>${esc(h.d)} district`:'')+
         (h.s?`<br>${esc(h.s)}`:'')+
-        `<br><span style="color:#93A4B2">OpenStreetMap. Presence is not a `+
+        `<br><span class="dim-note">OpenStreetMap. Presence is not a `+
         `guarantee of current capability.</span>`));
     layers.hospitals = L.layerGroup(m);
     add('Hospitals', layers.hospitals);
@@ -223,7 +456,7 @@ async function loadContext(){
           `<br>${esc((i.on||'').slice(0,10))}`+
           Object.entries(l).map(([k,v]) =>
             `<br>${esc(k.replace(/_/g,' '))}: ${fmt(v)}`).join('')+
-          `<br><span style="color:#93A4B2">NDRRMA BIPAD record. Reporting `+
+          `<br><span class="dim-note">NDRRMA BIPAD record. Reporting `+
           `lags the event.</span>`);
       });
     layers.impacts = L.layerGroup(m);
@@ -240,78 +473,390 @@ async function loadContext(){
       onEachFeature:(f,l)=>{
         const p = f.properties;
         l.bindPopup(`<b>${esc(p.name)}</b>`+
-          (p.name_codab ? `<br><span style="color:#6B7C8A">also written `+
+          (p.name_codab ? `<br><span class="faint-note">also written `+
             `${esc(p.name_codab)}</span>` : '')+
           `<br>${esc(p.unit_type||'type not recorded')}`+
           `<br>${esc(p.district)} district, ${esc(p.province||'')}`+
           (p.is_local_level === false
-            ? `<br><span style="color:#93A4B2">Protected area, not a local `+
+            ? `<br><span class="dim-note">Protected area, not a local `+
               `level. Little or no resident population.</span>` : ''));
       }
     });
     add('Local levels and protected areas', layers.municipalities);
   }
 
-  if (D.nsc) document.querySelector('[data-cat="nemrc"]').disabled = false;
+  if (D.nsc){
+    const btn = document.querySelector('[data-cat="nemrc"]');
+    if (btn) btn.disabled = false;
+    if (catalogue === 'nemrc') render();
+  }
+  if (selected && !document.getElementById('panel').hidden){
+    drawDetail(selected);
+  }
   buildAbout();
 }
 
-/* ------------------------------------------------------ live USGS refresh */
+/* ------------------------------------------- 3-tier multi-agency refresh */
 
-async function refreshFromUSGS(){
-  const q = D.live.query;
-  const url = 'https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson'
-    + '&orderby=time&minmagnitude=' + q.min_magnitude
-    + '&minlatitude=' + q.bbox.minlat + '&maxlatitude=' + q.bbox.maxlat
-    + '&minlongitude=' + q.bbox.minlon + '&maxlongitude=' + q.bbox.maxlon
-    + '&starttime=' + new Date(Date.now()-30*864e5).toISOString().slice(0,10);
-  try{
-    const fc = await (await fetch(url)).json();
-    const known = new Set(D.live.events.map(e=>e.id));
-    let added = 0;
-    for (const ft of fc.features){
-      if (known.has(ft.id)) continue;
-      const p = ft.properties, g = ft.geometry;
-      D.live.events.push({
-        id:ft.id, t:p.time, mag:p.mag, magType:p.magType,
-        depth:g.coordinates[2], lon:g.coordinates[0], lat:g.coordinates[1],
-        place:p.place, url:p.url, felt:p.felt, cdi:p.cdi, mmi:p.mmi,
-        alert:p.alert, sig:p.sig, status:p.status,
-        in_nepal:null, shakemap:null, exposure:null, _fresh:true
-      });
-      added++;
+function inBbox(lat, lon, bbox){
+  return Number.isFinite(lat) && Number.isFinite(lon)
+    && lat >= bbox.minlat && lat <= bbox.maxlat
+    && lon >= bbox.minlon && lon <= bbox.maxlon;
+}
+
+function normalizeUSGSFeatures(features, bbox, minMag){
+  const out = [];
+  for (const ft of features){
+    const p = ft?.properties;
+    const c = ft?.geometry?.coordinates;
+    if (!p || !Array.isArray(c) || c.length < 2) continue;
+    const lon = c[0] != null ? Number(c[0]) : NaN;
+    const lat = c[1] != null ? Number(c[1]) : NaN;
+    if (!inBbox(lat, lon, bbox)) continue;
+    const mag = p.mag != null ? Number(p.mag) : NaN;
+    if (!Number.isFinite(mag) || mag < minMag) continue;
+    const t = typeof p.time === 'number' ? p.time : Date.parse(p.time);
+    if (!Number.isFinite(t)) continue;
+    const rawDepth = c[2] != null ? Number(c[2]) : NaN;
+    out.push({
+      id: String(ft.id),
+      t,
+      mag,
+      magType: p.magType || null,
+      depth: Number.isFinite(rawDepth) ? rawDepth : null,
+      lon,
+      lat,
+      place: p.place || 'Unnamed location',
+      url: p.url || null,
+      felt: p.felt ?? null,
+      cdi: p.cdi ?? null,
+      mmi: p.mmi ?? null,
+      alert: p.alert ?? null,
+      sig: p.sig ?? null,
+      status: p.status ?? null,
+      source: 'USGS',
+      sources: ['USGS'],
+      agency: null,
+      in_nepal: null,
+      shakemap: null,
+      exposure: null,
+      _fresh: true
+    });
+  }
+  return out;
+}
+
+function normalizeEMSCFeatures(features, bbox, minMag){
+  const out = [];
+  for (const ft of features){
+    const p = ft?.properties || {};
+    const c = Array.isArray(ft?.geometry?.coordinates) ? ft.geometry.coordinates : [];
+    const lon = c[0] != null && Number.isFinite(Number(c[0])) ? Number(c[0]) : (p.lon != null ? Number(p.lon) : NaN);
+    const lat = c[1] != null && Number.isFinite(Number(c[1])) ? Number(c[1]) : (p.lat != null ? Number(p.lat) : NaN);
+    if (!inBbox(lat, lon, bbox)) continue;
+    const mag = p.mag != null ? Number(p.mag) : NaN;
+    if (!Number.isFinite(mag) || mag < minMag) continue;
+    const t = typeof p.time === 'number' ? p.time : Date.parse(p.time);
+    if (!Number.isFinite(t)) continue;
+    const rawDepth = p.depth != null ? Number(p.depth) : (c[2] != null ? Number(c[2]) : NaN);
+    const depth = Number.isFinite(rawDepth) ? Math.abs(rawDepth) : null;
+    const emscId = p.source_id || p.unid || ft.id;
+    const url = emscId
+      ? 'https://www.emsc-csem.org/Earthquake_information/earthquake.php?id=' + encodeURIComponent(String(emscId))
+      : null;
+    const auth = p.auth ? String(p.auth).trim().toUpperCase() : null;
+    out.push({
+      id: 'emsc-' + String(p.unid || ft.id || emscId || (t + '-' + lat.toFixed(2))),
+      emsc_id: emscId ? String(emscId) : null,
+      t,
+      mag,
+      magType: p.magtype || p.magType || null,
+      depth,
+      lon,
+      lat,
+      place: titleCaseRegion(p.flynn_region || p.place),
+      url,
+      emsc_url: url,
+      felt: null,
+      cdi: null,
+      mmi: null,
+      alert: null,
+      sig: null,
+      status: null,
+      source: 'EMSC',
+      sources: ['EMSC'],
+      agency: auth,
+      in_nepal: null,
+      shakemap: null,
+      exposure: null,
+      _fresh: true
+    });
+  }
+  return out;
+}
+
+async function fetchUSGSEvents(bbox, minMag, startDate){
+  const fdsnUrl = 'https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson'
+    + '&orderby=time&minmagnitude=' + minMag
+    + '&minlatitude=' + bbox.minlat + '&maxlatitude=' + bbox.maxlat
+    + '&minlongitude=' + bbox.minlon + '&maxlongitude=' + bbox.maxlon
+    + '&starttime=' + startDate;
+
+  // Tier 1: USGS FDSN (12s timeout + 1 retry)
+  for (let attempt = 0; attempt < 2; attempt++){
+    try{
+      const fc = await fetchJSONWithTimeout(fdsnUrl, 12000);
+      if (fc && Array.isArray(fc.features)){
+        return { ok:true, tier:'USGS FDSN', events:normalizeUSGSFeatures(fc.features, bbox, minMag) };
+      }
+    }catch(_err){
+      if (attempt === 0) await new Promise(res => setTimeout(res, 750));
     }
-    D.live.events.sort((a,b)=>b.t-a.t);
-    setFreshness(true, added);
-    render();
-  }catch(e){
-    setFreshness(false, 0);
+  }
+
+  // Tier 2: USGS CDN static feed filtered to Nepal bbox
+  try{
+    const cdnUrl = 'https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/2.5_month.geojson';
+    const fc = await fetchJSONWithTimeout(cdnUrl, 12000);
+    if (fc && Array.isArray(fc.features)){
+      return { ok:true, tier:'USGS CDN', events:normalizeUSGSFeatures(fc.features, bbox, minMag) };
+    }
+  }catch(_err){ /* fall through */ }
+
+  return { ok:false, tier:null, events:[] };
+}
+
+async function fetchEMSCEvents(bbox, minMag, startIso){
+  const emscUrl = 'https://www.seismicportal.eu/fdsnws/event/1/query?format=json'
+    + '&minlat=' + bbox.minlat + '&maxlat=' + bbox.maxlat
+    + '&minlon=' + bbox.minlon + '&maxlon=' + bbox.maxlon
+    + '&minmag=' + minMag + '&limit=200'
+    + '&start=' + encodeURIComponent(startIso);
+
+  for (let attempt = 0; attempt < 2; attempt++){
+    try{
+      const fc = await fetchJSONWithTimeout(emscUrl, 12000);
+      if (fc && Array.isArray(fc.features)){
+        return { ok:true, tier:'EMSC', events:normalizeEMSCFeatures(fc.features, bbox, minMag) };
+      }
+    }catch(_err){
+      if (attempt === 0) await new Promise(res => setTimeout(res, 750));
+    }
+  }
+  return { ok:false, tier:null, events:[] };
+}
+
+function addSourceTag(ev, tag){
+  if (!Array.isArray(ev.sources)) ev.sources = [ev.source || 'USGS'];
+  if (!ev.sources.includes(tag)) ev.sources.push(tag);
+  // Keep USGS first when multi-agency
+  if (ev.sources.includes('USGS') && ev.sources.includes('EMSC')){
+    ev.sources = ['USGS', 'EMSC', ...ev.sources.filter(s => s !== 'USGS' && s !== 'EMSC')];
   }
 }
 
-function setFreshness(liveOk, added){
+function findDuplicateEvent(events, cand){
+  let best = null;
+  let bestScore = Infinity;
+  for (const ex of events){
+    const dt = Math.abs(ex.t - cand.t);
+    if (dt > DEDUP_TIME_MS) continue;
+    const dist = haversine(ex.lat, ex.lon, cand.lat, cand.lon);
+    if (dist > DEDUP_DIST_KM) continue;
+    const score = (dt / DEDUP_TIME_MS) + (dist / DEDUP_DIST_KM);
+    if (score < bestScore){
+      bestScore = score;
+      best = ex;
+    }
+  }
+  return best;
+}
+
+function mergeMultiAgencyEvents(usgsEvents, emscEvents){
+  const existing = D.live.events;
+  let added = 0;
+
+  // 1. Merge USGS events first (authoritative for ShakeMap / PAGER / exposure)
+  for (const u of usgsEvents){
+    const byId = existing.find(e => e.id === u.id);
+    if (byId){
+      addSourceTag(byId, 'USGS');
+      if (u.felt != null) byId.felt = u.felt;
+      if (u.cdi != null) byId.cdi = u.cdi;
+      if (u.mmi != null) byId.mmi = u.mmi;
+      if (u.alert != null) byId.alert = u.alert;
+      if (u.status) byId.status = u.status;
+      if (u.mag != null) byId.mag = u.mag;
+      if (u.depth != null) byId.depth = u.depth;
+      continue;
+    }
+    const dup = findDuplicateEvent(existing, u);
+    if (dup){
+      // Upgrade an earlier EMSC-only record with USGS primary attributes
+      if (dup.source === 'EMSC' && !dup.sources?.includes('USGS')){
+        dup.emsc_url = dup.emsc_url || dup.url;
+        dup.id = u.id;
+        dup.t = u.t;
+        dup.mag = u.mag;
+        dup.magType = u.magType || dup.magType;
+        dup.depth = u.depth != null ? u.depth : dup.depth;
+        dup.lat = u.lat;
+        dup.lon = u.lon;
+        dup.place = u.place || dup.place;
+        dup.url = u.url || dup.url;
+        dup.felt = u.felt ?? dup.felt;
+        dup.cdi = u.cdi ?? dup.cdi;
+        dup.mmi = u.mmi ?? dup.mmi;
+        dup.alert = u.alert ?? dup.alert;
+        dup.sig = u.sig ?? dup.sig;
+        dup.status = u.status ?? dup.status;
+        dup.source = 'USGS';
+      }
+      addSourceTag(dup, 'USGS');
+      continue;
+    }
+    existing.push(u);
+    added++;
+  }
+
+  // 2. Merge EMSC events (preserving USGS ShakeMap / exposure / PAGER on matches)
+  for (const m of emscEvents){
+    const byId = existing.find(e => e.id === m.id || (m.emsc_id && e.emsc_id === m.emsc_id));
+    if (byId){
+      addSourceTag(byId, 'EMSC');
+      if (!byId.emsc_url && m.url) byId.emsc_url = m.url;
+      if (!byId.agency && m.agency) byId.agency = m.agency;
+      continue;
+    }
+    const dup = findDuplicateEvent(existing, m);
+    if (dup){
+      addSourceTag(dup, 'EMSC');
+      if (!dup.emsc_id && m.emsc_id) dup.emsc_id = m.emsc_id;
+      if (!dup.emsc_url && m.url) dup.emsc_url = m.url;
+      if (!dup.agency && m.agency) dup.agency = m.agency;
+      continue;
+    }
+    existing.push(m);
+    added++;
+  }
+
+  existing.sort((a,b) => b.t - a.t);
+  return added;
+}
+
+async function refreshLiveSeismic(manual = false){
+  if (liveRefreshInFlight) return;
+  liveRefreshInFlight = true;
+
+  const btn = document.getElementById('btn-refresh');
+  if (btn){
+    btn.disabled = true;
+    btn.classList.add('busy');
+    btn.textContent = '↻ Checking…';
+  }
+
+  const q = D.live?.query || {};
+  const bbox = q.bbox || DEFAULT_BBOX;
+  const minMag = q.min_magnitude ?? DEFAULT_MIN_MAG;
+  const since = new Date(Date.now() - 30 * 864e5);
+  const startDate = since.toISOString().slice(0, 10);
+  const startIso = since.toISOString().slice(0, 19);
+
+  try{
+    const [usgsRes, emscRes] = await Promise.all([
+      fetchUSGSEvents(bbox, minMag, startDate),
+      fetchEMSCEvents(bbox, minMag, startIso)
+    ]);
+
+    const anyOk = usgsRes.ok || emscRes.ok;
+    if (anyOk){
+      mergeMultiAgencyEvents(
+        usgsRes.ok ? usgsRes.events : [],
+        emscRes.ok ? emscRes.events : []
+      );
+      if (catalogue === 'usgs'){
+        const list = document.getElementById('events');
+        const prevScroll = list ? list.scrollTop : 0;
+        render();
+        if (list) list.scrollTop = prevScroll;
+      }
+      if (selected && !selected._nemrc && !document.getElementById('panel').hidden){
+        const refreshed = D.live.events.find(e => e.id === selected.id) || selected;
+        selected = refreshed;
+        drawDetail(selected);
+      }
+    } else if (!D.live.events.length && catalogue === 'usgs'){
+      document.getElementById('railnote').textContent =
+        'Could not load cached live.json or reach live USGS and EMSC feeds.';
+    }
+
+    const freshCount = (D.live?.events || []).filter(e => e._fresh).length;
+    setFreshness(usgsRes, emscRes, freshCount);
+  }catch(_err){
+    setFreshness({ ok:false }, { ok:false }, 0);
+  }finally{
+    lastLiveCheckMs = Date.now();
+    liveRefreshInFlight = false;
+    if (btn){
+      btn.disabled = false;
+      btn.classList.remove('busy');
+      btn.textContent = '↻ Refresh';
+    }
+  }
+}
+
+function setFreshness(usgsRes, emscRes, freshCount){
   const n = document.getElementById('freshness');
   const built = D.live?.generated ? new Date(D.live.generated).getTime() : null;
-  if (liveOk){
+  const agencies = [];
+  const tiers = [];
+  if (usgsRes?.ok){ agencies.push('USGS'); tiers.push(usgsRes.tier || 'USGS'); }
+  if (emscRes?.ok){ agencies.push('EMSC'); tiers.push(emscRes.tier || 'EMSC'); }
+
+  if (agencies.length){
+    const label = agencies.join(' + ');
     n.className = 'live';
-    n.textContent = added
-      ? `Live · ${added} event${added>1?'s':''} newer than last build`
-      : `Live · checked just now`;
+    n.title = `Active feeds: ${tiers.join(' + ')}` +
+      (built ? ` · static build ${whenText(built)}` : '');
+    if (built && freshCount > 0){
+      n.textContent = `Live (${label}) · ${freshCount} newer`;
+    } else if (!built && freshCount > 0){
+      n.textContent = `Live (${label}) · ${freshCount} events`;
+    } else {
+      n.textContent = `Live (${label}) · checked just now`;
+    }
   } else {
     n.className = 'stale';
+    n.title = 'Live USGS and EMSC endpoints could not be reached';
     n.textContent = built
-      ? `Cached · built ${ago(built)} (live check failed)`
-      : 'Cached data';
+      ? `Cached · built ${ago(built)} (live feeds unreachable)`
+      : 'Cached data (live feeds unreachable)';
   }
+}
+
+function scheduleLivePoll(){
+  if (livePollTimer) clearInterval(livePollTimer);
+  livePollTimer = setInterval(() => {
+    if (!document.hidden && navigator.onLine !== false){
+      refreshLiveSeismic(false);
+    }
+  }, LIVE_POLL_MS);
 }
 
 /* ----------------------------------------------------------- list & map */
 
 function currentEvents(){
   if (catalogue === 'nemrc'){
+    const nemrcUrl = D.nsc?.source?.url || 'https://seismonepal.gov.np/en/earthquakes';
     return (D.nsc?.events || [])
-      .filter(e => e.mag >= magMin)
-      .map(e => ({...e, id:'nemrc-'+e.t, place:e.epicentre, _nemrc:true}));
+      .filter(e => (e.mag ?? 0) >= magMin)
+      .map((e, i) => ({
+        ...e,
+        id: `nemrc-${e.t}-${i}`,
+        place: e.epicentre,
+        url: e.url || nemrcUrl,
+        _nemrc: true
+      }));
   }
   return (D.live?.events || []).filter(e => (e.mag ?? 0) >= magMin);
 }
@@ -324,11 +869,18 @@ function render(){
 
   const note = document.getElementById('railnote');
   if (catalogue === 'nemrc'){
-    note.textContent = `${evs.length} events from Nepal's NEMRC catalogue `
-      + `(ML). Magnitudes are NEMRC's own and differ from USGS.`;
+    note.textContent = D.nsc
+      ? `${evs.length} events from Nepal's NEMRC catalogue (ML). Magnitudes are NEMRC's own and differ from USGS.`
+      : 'Loading Nepal\'s NEMRC catalogue…';
   } else {
-    const withEx = evs.filter(e=>e.exposure).length;
-    note.textContent = `${evs.length} events from USGS. `
+    const withEx = evs.filter(e => e.exposure).length;
+    const multi = evs.filter(e => (e.sources || []).includes('USGS') && (e.sources || []).includes('EMSC')).length;
+    const emscOnly = evs.filter(e => !(e.sources || ['USGS']).includes('USGS') && (e.sources || []).includes('EMSC')).length;
+    const breakdown = [];
+    if (multi) breakdown.push(`${multi} USGS + EMSC`);
+    if (emscOnly) breakdown.push(`${emscOnly} EMSC-only`);
+    const extra = breakdown.length ? ` (${breakdown.join(', ')})` : '';
+    note.textContent = `${evs.length} events from USGS + EMSC${extra}. `
       + `${withEx} have a ShakeMap and an exposure estimate.`;
   }
 
@@ -337,16 +889,21 @@ function render(){
     const li = el('li','ev');
     li.tabIndex = 0;
     li.setAttribute('role','button');
-    const tags = [];
+    if (selected && selected.id === e.id){
+      li.setAttribute('aria-current', 'true');
+    }
+    const srcInfo = sourceBadgeInfo(e);
+    const tags = [`<span class="${srcInfo.cls}">${esc(srcInfo.text)}</span>`];
+    if (e._fresh)  tags.push('<span class="tag fresh">Live</span>');
     if (e.shakemap) tags.push('<span class="tag sm">ShakeMap</span>');
     if (e.alert)   tags.push(`<span class="tag al-${esc(e.alert)}">PAGER ${esc(e.alert)}</span>`);
-    if (e._nemrc)  tags.push('<span class="tag">NEMRC ML</span>');
+    const depthTxt = e.depth != null ? Math.round(e.depth) + ' km deep' : 'depth not reported';
     li.innerHTML =
       `<div><span class="ev-m">${(e.mag??0).toFixed(1)}</span>`+
       `<span class="ev-t">${ago(e.t)}</span></div>`+
       `<div><div class="ev-p">${esc(e.place||'Unnamed location')}</div>`+
-      `<div class="ev-s">${Math.round(e.depth??0)} km deep · ${whenText(e.t)}</div>`+
-      (tags.length?`<div class="tagrow">${tags.join('')}</div>`:'')+
+      `<div class="ev-s">${depthTxt} · ${whenText(e.t)}</div>`+
+      `<div class="tagrow">${tags.join('')}</div>`+
       `</div>`;
     li.addEventListener('click', ()=>select(e));
     li.addEventListener('keydown', ev=>{
@@ -375,13 +932,26 @@ function select(e){
   drawShakemap(e);
 }
 
+function closePanel(){
+  const p = document.getElementById('panel');
+  if (!p || p.hidden) return;
+  p.hidden = true;
+  selected = null;
+  document.querySelectorAll('.ev').forEach(n => n.setAttribute('aria-current', 'false'));
+  if (layers.contours){
+    map.removeLayer(layers.contours);
+    layers.contours = null;
+  }
+}
+
 /* --------------------------------------------------------- shakemap draw */
 
 async function drawShakemap(e){
   if (layers.contours){ map.removeLayer(layers.contours); layers.contours = null; }
-  if (!e.shakemap?.contour_url) return;
+  const contourHref = safeUrl(e.shakemap?.contour_url, ['*.usgs.gov']);
+  if (!contourHref) return;
   try{
-    const gj = await (await fetch(e.shakemap.contour_url)).json();
+    const gj = await (await fetch(contourHref)).json();
     layers.contours = L.geoJSON(gj, {
       style: f => ({
         color: f.properties.color || mmiColor(f.properties.value),
@@ -391,7 +961,7 @@ async function drawShakemap(e){
         `MMI ${f.properties.value} — ${MMI_WORD[Math.round(f.properties.value)]||''}`,
         {sticky:true})
     }).addTo(map);
-  }catch(err){ /* contour overlay is optional; the panel still works */ }
+  }catch(_err){ /* contour overlay is optional; the panel still works */ }
 }
 
 /* ------------------------------------------------------------ detail panel */
@@ -408,23 +978,31 @@ function drawDetail(e){
     `<div class="p-mag">M ${(e.mag??0).toFixed(1)}<small>${esc(e.magType||'')}</small></div>`+
     `<p class="p-place">${esc(e.place||'Unnamed location')}</p>`+
     `<p class="p-time">${whenText(e.t)} · ${ago(e.t)}</p>`;
-  h.querySelector('.p-close').addEventListener('click', ()=>{
-    p.hidden = true;
-    if (layers.contours){ map.removeLayer(layers.contours); layers.contours=null; }
-  });
+  h.querySelector('.p-close').addEventListener('click', closePanel);
   p.appendChild(h);
 
   // --- basics
   const b = el('div','sec');
+  const srcInfo = sourceBadgeInfo(e);
+  const linkList = [];
+  const primaryHref = safeUrl(e.url, EVENT_HOSTS);
+  if (primaryHref){
+    linkList.push(`<a href="${esc(primaryHref)}" target="_blank" rel="noopener noreferrer">${esc(eventPageLabel(primaryHref))}</a>`);
+  }
+  const emscHref = safeUrl(e.emsc_url, EVENT_HOSTS);
+  if (emscHref && emscHref !== primaryHref){
+    linkList.push(`<a href="${esc(emscHref)}" target="_blank" rel="noopener noreferrer">${esc(eventPageLabel(emscHref))}</a>`);
+  }
+
   b.innerHTML = `<h3>Origin</h3>
     <dl class="kv">
-      <dt>Depth</dt><dd>${e.depth!=null?Math.round(e.depth)+' km':'—'}</dd>
+      <dt>Depth</dt><dd>${e.depth!=null?Math.round(e.depth)+' km':'Not reported'}</dd>
       <dt>Coordinates</dt><dd>${e.lat.toFixed(3)}, ${e.lon.toFixed(3)}</dd>
-      <dt>Catalogue</dt><dd>${e._nemrc?'NEMRC (Nepal)':'USGS'}</dd>
+      <dt>Catalogue</dt><dd><span class="${srcInfo.cls}">${esc(srcInfo.catalogueText)}</span>${e._fresh?' <span class="tag fresh">Live</span>':''}</dd>
       ${e.status?`<dt>Review status</dt><dd>${esc(e.status)}</dd>`:''}
       ${e.felt?`<dt>Felt reports</dt><dd>${fmt(e.felt)}</dd>`:''}
     </dl>`+
-    (e.url?`<p><a href="${esc(e.url)}" target="_blank" rel="noopener">Open the USGS event page</a></p>`:'');
+    (linkList.length ? `<p class="ev-links">${linkList.join('')}</p>` : '');
   p.appendChild(b);
 
   // --- where this is, administratively
@@ -467,10 +1045,15 @@ function exposureSection(e){
   const wrap = el('div','bars');
   for (const [mmi, pop] of bands){
     const row = el('div','brow');
-    row.innerHTML =
-      `<span class="blab">MMI ${mmi}+</span>`+
-      `<span class="btrack"><span class="bfill" style="width:${(pop/max*100).toFixed(1)}%;background:${mmiColor(mmi)}"></span></span>`+
-      `<span class="bval">${fmt(pop)}</span>`;
+    const lab = el('span','blab');
+    lab.textContent = `MMI ${mmi}+`;
+    const track = el('span','btrack');
+    const fill = el('span', `bfill ${mmiClass(mmi)}`);
+    fill.style.width = `${(pop/max*100).toFixed(1)}%`;
+    track.appendChild(fill);
+    const val = el('span','bval');
+    val.textContent = fmt(pop);
+    row.append(lab, track, val);
     wrap.appendChild(row);
   }
   s.appendChild(wrap);
@@ -491,10 +1074,10 @@ function exposureSection(e){
 
   s.appendChild(el('p','note',
     `<strong>How to read this.</strong> Intensity is USGS ShakeMap output.
-     Population is an estimate: 2023 district census projections spread across
-     a 5 km grid by settlement density, then sampled against that ShakeMap.
-     Treat these as order-of-magnitude figures for planning, not as counts.
-     They cover Nepal only, so a cross-border event will read low.`));
+     Population uses 2021 census ward populations allocated to a 5 km grid,
+     sampled against USGS ShakeMap. Treat these as order-of-magnitude figures
+     for planning, not as counts. They cover Nepal only, so a cross-border
+     event will read low.`));
 
   if (e.pager?.alert){
     s.appendChild(el('p','note',
@@ -510,7 +1093,6 @@ function exposureSection(e){
 function nearestWard(lat, lon){
   const w = D.wards;
   if (!w) return null;
-  const F = w.fields;
   let best = null, bestD = Infinity;
   for (const row of w.wards){
     const d = haversine(lat, lon, row[1], row[0]);
@@ -553,11 +1135,11 @@ function censusFor(w){
 
 /** Vulnerable-wall share, coloured by how far above the national median. */
 function vulnBand(p){
-  if (p >= 85) return ['#FF0000','far above the national median'];
-  if (p >= 70) return ['#FF9100','above the national median'];
-  if (p >= 50) return ['#FFC900','near the national median'];
-  if (p >= 25) return ['#7EFA8D','below the national median'];
-  return ['#7DF9F9','far below the national median'];
+  if (p >= 85) return ['mmi-9','far above the national median'];
+  if (p >= 70) return ['mmi-8','above the national median'];
+  if (p >= 50) return ['mmi-7','near the national median'];
+  if (p >= 25) return ['mmi-5','below the national median'];
+  return ['mmi-4','far below the national median'];
 }
 
 function wardSection(e){
@@ -570,7 +1152,7 @@ function wardSection(e){
   }
   s.appendChild(el('dl','kv',
     `<dt>Ward</dt><dd>${esc(String(w.ward))}</dd>`+
-    `<dt>Local level</dt><dd>${esc(w.municipality||'—')}${w.type?` <span style="color:#6B7C8A">(${esc(w.type)})</span>`:''}</dd>`+
+    `<dt>Local level</dt><dd>${esc(w.municipality||'—')}${w.type?` <span class="faint-note">(${esc(w.type)})</span>`:''}</dd>`+
     `<dt>District</dt><dd>${esc(w.district||'—')}</dd>`+
     `<dt>Province</dt><dd>${esc(w.province||'—')}</dd>`));
   const cr = censusFor(w);
@@ -581,13 +1163,18 @@ function wardSection(e){
       `<dt>Population</dt><dd>${fmt(pop)}</dd>`+
       `<dt>Households</dt><dd>${fmt(hh)}</dd>`));
     if (vp != null){
-      const [col, word] = vulnBand(vp);
+      const [colCls, word] = vulnBand(vp);
       s.appendChild(el('h3','','Building vulnerability'));
       const row = el('div','brow');
-      row.innerHTML =
-        `<span class="blab">Walls</span>`+
-        `<span class="btrack"><span class="bfill" style="width:${vp}%;background:${col}"></span></span>`+
-        `<span class="bval">${vp}%</span>`;
+      const lab = el('span','blab');
+      lab.textContent = 'Walls';
+      const track = el('span','btrack');
+      const fill = el('span', `bfill ${colCls}`);
+      fill.style.width = `${Math.max(0, Math.min(100, Number(vp) || 0))}%`;
+      track.appendChild(fill);
+      const val = el('span','bval');
+      val.textContent = `${vp}%`;
+      row.append(lab, track, val);
       s.appendChild(row);
       s.appendChild(el('p','',
         `${vp}% of households here have outer walls of mud-bonded brick or
@@ -623,7 +1210,7 @@ function nearestSection(e){
   const ul = el('ul','lst');
   for (const h of near){
     ul.appendChild(el('li','',
-      `<span class="nm">${esc(h.n)}${h.d?` <span style="color:#6B7C8A">· ${esc(h.d)}</span>`:''}</span>`+
+      `<span class="nm">${esc(h.n)}${h.d?` <span class="faint-note">· ${esc(h.d)}</span>`:''}</span>`+
       `<span class="d">${km(h.dist)}</span>`));
   }
   s.appendChild(ul);
@@ -654,7 +1241,7 @@ function placesSection(e){
   const ul = el('ul','lst');
   for (const q of show){
     ul.appendChild(el('li','',
-      `<span class="nm">${esc(q.n)} <span style="color:#6B7C8A">${esc(q.k)}${q.m?` · ${esc(q.m)}`:''}</span></span>`+
+      `<span class="nm">${esc(q.n)} <span class="faint-note">${esc(q.k)}${q.m?` · ${esc(q.m)}`:''}</span></span>`+
       `<span class="d">${km(q.dist)}</span>`));
   }
   s.appendChild(ul);
@@ -707,7 +1294,7 @@ function contactSection(){
   const wrap = el('div','calls');
   for (const n of c.national){
     const a = el('a','call');
-    a.href = 'tel:'+n.number;
+    a.href = 'tel:'+String(n.number||'').replace(/[^\d+*#-]/g,'');
     a.innerHTML = `<b>${esc(n.number)}</b><span>${esc(n.label)}<br>${esc(n.detail||'')}</span>`;
     wrap.appendChild(a);
   }
@@ -719,7 +1306,7 @@ function contactSection(){
     const w2 = el('div','calls');
     for (const n of dh.candidates){
       const a = el('a','call');
-      a.href = 'tel:'+n.number;
+      a.href = 'tel:'+String(n.number||'').replace(/[^\d+*#-]/g,'');
       a.innerHTML = `<b>${esc(n.number)}</b><span>${esc(n.label)}</span>`;
       w2.appendChild(a);
     }
@@ -732,8 +1319,12 @@ function contactSection(){
   s.appendChild(el('h3','','Institutions'));
   const ul = el('ul','lst');
   for (const i of c.institutions){
+    const href = safeUrl(i.website);
+    const linkHtml = href
+      ? `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer">${esc(i.name)}</a>`
+      : esc(i.name);
     ul.appendChild(el('li','',
-      `<span class="nm"><a href="${esc(i.website)}" target="_blank" rel="noopener">${esc(i.name)}</a></span>`+
+      `<span class="nm">${linkHtml}</span>`+
       `<span class="d">${esc((i.phone||[]).join(' / ') || '—')}</span>`));
   }
   s.appendChild(ul);
@@ -750,38 +1341,86 @@ function addLegend(){
   const c = L.control({position:'bottomleft'});
   c.onAdd = () => {
     const d = L.DomUtil.create('div','legend');
-    const ramp = [3,4,5,6,7,8,9,10].map(v=>`<i style="background:${MMI_COLOR[v]}"></i>`).join('');
+    const ramp = [3,4,5,6,7,8,9,10].map(v => `<i class="mmi-${v}"></i>`).join('');
     d.innerHTML = `<h4>Shaking intensity (MMI)</h4>
       <div class="ramp">${ramp}</div>
       <div class="ramp-lab"><span>Weak</span><span>Extreme</span></div>
-      <div style="margin-top:.4rem">Circle size shows magnitude. Colour shows
+      <div class="legend-sub">Circle size shows magnitude. Colour shows
       measured intensity where USGS has one, otherwise magnitude band.</div>`;
     return d;
   };
   c.addTo(map);
 }
 
+function setAboutOpen(open){
+  const sheet = document.getElementById('about');
+  const btn = document.getElementById('btn-about');
+  sheet.hidden = !open;
+  if (btn) btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  if (open){
+    const closeBtn = document.getElementById('about-close');
+    if (closeBtn) closeBtn.focus();
+  } else if (btn && document.activeElement && sheet.contains(document.activeElement)){
+    btn.focus();
+  }
+}
+
 function wireUI(){
   document.querySelectorAll('.seg button').forEach(b => {
     b.addEventListener('click', () => {
-      document.querySelectorAll('.seg button').forEach(x=>x.classList.remove('on'));
+      document.querySelectorAll('.seg button').forEach(x => {
+        x.classList.remove('on');
+        x.setAttribute('aria-pressed', 'false');
+      });
       b.classList.add('on');
+      b.setAttribute('aria-pressed', 'true');
       catalogue = b.dataset.cat;
       render();
     });
   });
+
   const slider = document.getElementById('magmin');
   slider.addEventListener('input', () => {
     magMin = +slider.value;
     document.getElementById('magout').textContent = magMin.toFixed(1);
     render();
   });
+
+  const btnRefresh = document.getElementById('btn-refresh');
+  if (btnRefresh){
+    btnRefresh.addEventListener('click', () => refreshLiveSeismic(true));
+  }
+
   const sheet = document.getElementById('about');
-  document.getElementById('btn-about').addEventListener('click', ()=>{
-    sheet.hidden = !sheet.hidden;
+  document.getElementById('btn-about').addEventListener('click', () => {
+    setAboutOpen(sheet.hidden);
   });
-  document.getElementById('about-close').addEventListener('click', ()=> sheet.hidden = true);
-  document.addEventListener('keydown', e => { if (e.key==='Escape') sheet.hidden = true; });
+  document.getElementById('about-close').addEventListener('click', () => setAboutOpen(false));
+  sheet.addEventListener('click', ev => {
+    if (ev.target === sheet) setAboutOpen(false);
+  });
+
+  document.addEventListener('keydown', e => {
+    if (e.key !== 'Escape') return;
+    if (!sheet.hidden){
+      setAboutOpen(false);
+      return;
+    }
+    const panel = document.getElementById('panel');
+    if (panel && !panel.hidden){
+      closePanel();
+    }
+  });
+
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && (Date.now() - lastLiveCheckMs) > LIVE_POLL_MS){
+      refreshLiveSeismic(false);
+    }
+  });
+
+  window.addEventListener('online', () => {
+    refreshLiveSeismic(false);
+  });
 }
 
 function buildAbout(){
@@ -796,9 +1435,11 @@ function buildAbout(){
     <h3>Where each thing comes from</h3>
     <ul>
       <li><b>Earthquake locations and magnitudes</b> — USGS FDSN event
-      service, and Nepal's National Earthquake Monitoring and Research Centre
-      (NEMRC). The two are independent and their magnitudes differ for the
-      same event. Neither is adjusted to match the other.</li>
+      service (with USGS GeoJSON feed fallback), EMSC SeismicPortal FDSN
+      (deduplicated with USGS within 90 s and 65 km), and Nepal's National
+      Earthquake Monitoring and Research Centre (NEMRC). NEMRC is independent
+      and its local magnitudes (ML) differ from USGS/EMSC; neither is adjusted
+      to match the other.</li>
       <li><b>Shaking intensity</b> — USGS ShakeMap. Only events with a
       ShakeMap show intensity. Nothing here models shaking itself.</li>
       <li><b>Population</b> — the 2021 census, at ward level: 6,743 wards,

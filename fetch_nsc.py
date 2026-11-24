@@ -29,17 +29,50 @@ not reconcile them. Both are shown, attributed to their source.
 import json
 import os
 import re
+import ssl
 import sys
+import tempfile
 import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DATA = os.path.abspath(os.path.join(HERE, "..", "data"))
+ROOT = os.path.abspath(os.path.join(HERE, "..")) if os.path.basename(HERE) == "scripts" else HERE
+DATA = os.path.join(ROOT, "data") if os.path.isdir(os.path.join(ROOT, "data")) else ROOT
 
 URL = "https://seismonepal.gov.np/en/earthquakes"
 BROWSER_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+
+
+def atomic_write_json(path, obj):
+    """Write JSON via a same-directory temp file and os.replace."""
+    parent = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(prefix=".nsc_", suffix=".tmp", dir=parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(obj, f, separators=(",", ":"), ensure_ascii=False)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _is_tls_cert_error(exc):
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        return True
+    if isinstance(exc, urllib.error.URLError) and isinstance(
+        getattr(exc, "reason", None), ssl.SSLCertVerificationError
+    ):
+        return True
+    return False
 
 
 def fetch(url, retries=3):
@@ -54,6 +87,8 @@ def fetch(url, retries=3):
                 return r.read().decode("utf-8", errors="replace")
         except Exception as e:                        # noqa: BLE001
             last = e
+            if _is_tls_cert_error(e):
+                raise
             time.sleep(3 * (a + 1))
     raise last
 
@@ -124,9 +159,18 @@ def main():
     max_pages = int(os.environ.get("NSC_MAX_PAGES", "60"))
 
     print("fetching NEMRC catalogue ...", flush=True)
-    first = fetch(URL)
+    try:
+        first = fetch(URL)
+    except (ssl.SSLCertVerificationError, ssl.SSLError,
+            urllib.error.URLError, OSError) as e:
+        print(f"seismonepal.gov.np TLS/connection error — keeping previous "
+              f"nsc.json intact ({e})", file=sys.stderr)
+        return 1
+
     if "Mod_Security" in first or "Not Acceptable" in first:
-        raise SystemExit("blocked by ModSecurity; user agent may need updating")
+        print("blocked by ModSecurity; user agent may need updating — keeping "
+              "previous nsc.json intact", file=sys.stderr)
+        return 1
 
     pages = [int(m) for m in re.findall(r"earthquakes\?page=(\d+)", first)]
     last_page = min(max(pages) if pages else 1, max_pages)
@@ -137,6 +181,10 @@ def main():
     for p in range(2, last_page + 1):
         try:
             events.extend(parse(fetch(f"{URL}?page={p}")))
+        except (ssl.SSLCertVerificationError, ssl.SSLError,
+                urllib.error.URLError, OSError) as e:
+            print(f"  page {p} TLS/connection error, stopping early: {e}")
+            break
         except Exception as e:                        # noqa: BLE001
             print(f"  page {p} failed, stopping early: {e}")
             break
@@ -159,9 +207,9 @@ def main():
     print(f"  parsed {len(events)} events")
     if not events:
         # Fail loudly. A silent empty list would look like a quiet period.
-        raise SystemExit("parsed zero events — the page layout has probably "
-                         "changed. Fix the parser rather than shipping an "
-                         "empty feed.")
+        print("parsed zero events — the page layout has probably changed. "
+              "Keeping previous nsc.json intact.", file=sys.stderr)
+        return 1
 
     events.sort(key=lambda r: -r["t"])
     out = {
@@ -184,12 +232,11 @@ def main():
         "events": events,
     }
     path = os.path.join(DATA, "nsc.json")
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(out, f, separators=(",", ":"), ensure_ascii=False)
-        f.write("\n")
+    atomic_write_json(path, out)
     print(f"wrote nsc.json ({len(events)} events, "
           f"latest {events[0]['utc']} M{events[0]['mag']} "
           f"{events[0]['epicentre']})")
+    return 0
 
 
 if __name__ == "__main__":
